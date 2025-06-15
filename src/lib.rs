@@ -11,6 +11,8 @@ use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 use std::{mem, thread};
 
+
+#[derive(Debug)]
 pub struct CompletionStage<T: Send+Sync+'static>(Arc<CompletionStageInner<T>>);
 
 impl<T: Send+Sync+'static> Clone for CompletionStage<T> {
