@@ -2,6 +2,13 @@
 name = "completion_stage"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Alexander Schütz <aschuetz@protonmail.com>"]
+keywords = ["async", "thread", "promise", "future", "completion"]
+categories = ["asynchronous", "concurrency"]
+description = "Push-based futures for Rust similar to Java's CompletionStage"
+readme = "README.md"
+repository = "https://github.com/AlexanderSchuetz97/completion_stage"
 
 [dependencies]
 parking_lot = "0.12.4"
