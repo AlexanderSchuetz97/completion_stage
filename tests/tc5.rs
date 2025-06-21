@@ -23,7 +23,6 @@ fn test2() {
         let _g3 = ftr.take().unwrap();
         drop(g2);
         drop(g1);
-        
     });
     let tmp = n.join().unwrap_err();
     let msg = tmp.downcast::<&str>().unwrap();

@@ -78,6 +78,13 @@ as rust panic's should not be used in lieu of exceptions.
 
 If you compile your code with `panic=abort` then none of this matters to you.
 
+## Deadlocks
+The implementation automatically detects simple deadlocks.
+All deadlocks that are caused by a thread waiting on itself are detected.
+For example, borrowing the value of a stage while trying to take the value from the stage is detected.
+This generally causes the taking operation to fail. 
+Some taking operation's panic in this case, which is made explicit in their documentation.
+
 ## Use-Case
 I intend to use this crate to "return" results to an opengl ui-thread.
 The opengl ui "thread" will start background tasks when, for example, a "button" is pressed

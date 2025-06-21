@@ -1,9 +1,9 @@
+use completion_stage::CompletionStage;
 use std::thread;
 use std::time::Duration;
-use completion_stage::CompletionStage;
 
 fn main() {
-    let first_stage : CompletionStage<i32> = CompletionStage::new();
+    let first_stage: CompletionStage<i32> = CompletionStage::new();
     {
         //The CompletionStage is reference counted so it can be sent/shared with any thread.
         let first_stage = first_stage.clone();
@@ -15,9 +15,9 @@ fn main() {
         });
     }
 
-    let second_stage : CompletionStage<String> = first_stage.and_then_apply(|intermediate : i32| {
-        // Executed in the same thread as above, 
-        // or the main thread if the thread above is already finished, 
+    let second_stage: CompletionStage<String> = first_stage.and_then_apply(|intermediate: i32| {
+        // Executed in the same thread as above,
+        // or the main thread if the thread above is already finished,
         // which is unlikely for this example
         return format!("The result is {intermediate}");
     });

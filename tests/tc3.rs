@@ -1,6 +1,6 @@
+use completion_stage::{CompletionStage, GetTimeoutResult, InfallibleExecutor};
 use std::thread;
 use std::time::Duration;
-use completion_stage::{CompletionStage, GetTimeoutResult, InfallibleExecutor};
 
 struct ShittyExecutor;
 
@@ -23,14 +23,14 @@ fn test() {
             });
 
             assert_eq!(123, *comp.unwrap());
-        });    
-        
+        });
+
         cl.complete_with_value(());
     });
-    
+
     if let GetTimeoutResult::Value(_) = ftr.get_timeout(Duration::from_millis(2000)) {
         return;
     }
-    
+
     panic!("failed");
 }

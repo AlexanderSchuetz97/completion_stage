@@ -1,33 +1,83 @@
+//! # completion_stage
+//! Push-based futures for Rust similar to Java's CompletionStage.
+//!
+//! ## Simple Example
+//! ```rust
+//! use std::thread;
+//! use std::time::Duration;
+//! use completion_stage::CompletionStage;
+//!
+//! fn main() {
+//!     let result : String = CompletionStage::new_async::<thread::Thread>(|| {
+//!         // Executed in a new virgin thread via thread::spawn,
+//!         // you can provide your own executor via the generic instead of 'thread::Thread'
+//!         // by implementing a simple trait for your executor.
+//!         //
+//!         // Do some background task here
+//!         thread::sleep(Duration::from_secs(5));
+//!         //
+//!         // eventually return the result.
+//!         return 12345;
+//!     }).and_then_apply(|intermediate| {
+//!         // Executed in the same thread as above,
+//!         // or the main thread if the thread above is already finished,
+//!         // which is unlikely for this example
+//!         return format!("The result is {intermediate}");
+//!     }).unwrap();
+//!
+//!     println!("{}", result);
+//! }
+//! ```
+#![allow(non_snake_case)]
+#![allow(non_camel_case_types)]
+#![deny(clippy::correctness)]
+#![deny(
+    clippy::perf,
+    clippy::complexity,
+    clippy::style,
+    clippy::nursery,
+    clippy::pedantic,
+    clippy::clone_on_ref_ptr,
+    clippy::decimal_literal_representation,
+    clippy::float_cmp_const,
+    clippy::missing_docs_in_private_items,
+    clippy::multiple_inherent_impl,
+    clippy::unwrap_used,
+    clippy::cargo_common_metadata,
+    clippy::used_underscore_binding
+)]
 use defer_heavy::defer;
-use parking_lot::{Condvar, MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::collections::HashMap;
+use parking_lot::{
+    Condvar, MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::io::Error;
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::Arc;
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 use std::{mem, thread};
-
+use std::vec::IntoIter;
 
 #[derive(Debug)]
-pub struct CompletionStage<T: Send+Sync+'static>(Arc<CompletionStageInner<T>>);
+pub struct CompletionStage<T: Send + Sync + 'static>(Arc<CompletionStageInner<T>>);
 
-impl<T: Send+Sync+'static> Clone for CompletionStage<T> {
+impl<T: Send + Sync + 'static> Clone for CompletionStage<T> {
     fn clone(&self) -> Self {
         CompletionStage(self.0.clone())
     }
 }
 
-/// Completion that did not take the value out of the stage.
+/// Enum that represents completion of the stage
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Completion<T> {
     Taken,
     Panic,
     DeadLock,
-    Value(T)
+    Value(T),
 }
 
 impl<T> Completion<T> {
@@ -46,8 +96,16 @@ impl<T> Completion<T> {
             _ => None,
         }
     }
-}
 
+    pub fn map<X>(self, func: impl FnOnce(T) -> X) -> Completion<X> {
+        match self {
+            Completion::Taken => Completion::Taken,
+            Completion::Panic => Completion::Panic,
+            Completion::DeadLock => Completion::DeadLock,
+            Completion::Value(v) => Completion::Value(func(v)),
+        }
+    }
+}
 
 #[derive(Debug)]
 enum CellValue<T> {
@@ -55,7 +113,7 @@ enum CellValue<T> {
     Taken,
     Panic,
     DeadLock,
-    Value(T)
+    Value(T),
 }
 
 impl<T> CellValue<T> {
@@ -65,10 +123,7 @@ impl<T> CellValue<T> {
             CellValue::Taken => CellValue::Taken,
             CellValue::Panic => CellValue::Panic,
             CellValue::DeadLock => CellValue::DeadLock,
-            CellValue::Value(_) => {
-                mem::replace(self, CellValue::Taken)
-            }
-
+            CellValue::Value(_) => mem::replace(self, CellValue::Taken),
         }
     }
 
@@ -80,9 +135,8 @@ impl<T> CellValue<T> {
             CellValue::DeadLock => CellValue::DeadLock,
             CellValue::Value(_) => {
                 CellValue::Value(RwLockReadGuard::map(guard, |grd| {
-                    let CellValue::Value(value) = grd else  {
-                        //TODO can I use try map to not have this here?
-                        //Should be fine but ehh.
+                    let CellValue::Value(value) = grd else {
+                        //This is unreachable because we hold a lock on the cell the entire time, and we already know its Value.
                         unreachable!()
                     };
 
@@ -93,13 +147,13 @@ impl<T> CellValue<T> {
     }
 }
 
-enum Taker<T: Send+Sync> {
+enum Taker<T: Send + Sync> {
     None,
-    Some(Box<dyn FnOnce(Completion<T>)+Send>),
+    Some(Box<dyn FnOnce(Completion<T>) + Send>),
     Closed,
 }
 
-impl<T: Send+Sync> Debug for Taker<T> {
+impl<T: Send + Sync> Debug for Taker<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Taker::None => f.write_str("None"),
@@ -109,92 +163,32 @@ impl<T: Send+Sync> Debug for Taker<T> {
     }
 }
 
-impl<T: Send+Sync> Taker<T> {
-
+impl<T: Send + Sync> Taker<T> {
     fn is_none(&self) -> bool {
         matches!(self, Taker::None)
     }
-    
-    fn take(&mut self) -> Option<Box<dyn FnOnce(Completion<T>)+Send>> {
+
+    fn take(&mut self) -> Option<Box<dyn FnOnce(Completion<T>) + Send>> {
         if let Taker::Some(fbox) = mem::replace(self, Taker::Closed) {
             return Some(fbox);
         }
-        
+
         None
-        
     }
 }
 #[derive(Debug)]
-enum RefTaskState<T: Send+Sync> {
+enum RefTaskState<T: Send + Sync> {
     Closed,
     Empty,
-    Node(TaskStackNode<T>)
+    Node(TaskStackNode<T>),
 }
 
-impl<T: Send+Sync> RefTaskState<T> {
-    fn invoke_ref(self, data: &Completion<T>) {
-        match self {
-            RefTaskState::Closed => panic!("ref_task_state closed in complete even tho cell was not empty."),
-            RefTaskState::Empty => (),
-            RefTaskState::Node(mut node) => {
-                let Some(task) = node.task.take() else {
-                    panic!("node.task.take() is none");
-                };
-
-
-                Self::invoke_next(data, &mut node, task);
-
-                while let Some(next) = node.next.take() {
-                    node.next = next.next;
-                    let Some(task) = node.task.take() else {
-                        panic!("node.task.take() is none");
-                    };
-
-                    Self::invoke_next(data, &mut node, task);
-                }
-            }
-        }
-    }
-
-    fn invoke(self, data: Completion<&T>) {
-        match self {
-            RefTaskState::Closed => panic!("ref_task_state closed in complete even tho cell was not empty."),
-            RefTaskState::Empty => (),
-            RefTaskState::Node(mut node) => {
-                let Some(task) = node.task.take() else {
-                    panic!("node.task.take() is none");
-                };
-
-                Self::invoke_next_ref(data, &mut node, task);
-
-                while let Some(next) = node.next.take() {
-                    node.next = next.next;
-                    let Some(task) = node.task.take() else {
-                        panic!("node.task.take() is none");
-                    };
-
-                    Self::invoke_next_ref(data, &mut node, task);
-                }
-            }
-        }
-    }
-
-    fn unwind_panic_all(node: &mut TaskStackNode<T>) {
-        if std::thread::panicking() {
-            while let Some(next) = node.next.take() {
-                node.next = next.next;
-                let Some(task) = node.task.take() else {
-                    panic!("node.task.take() is none");
-                };
-
-                task(Completion::Panic);
-            }
-        }
-    }
-
-    fn invoke_next(data: &Completion<T>, node: &mut TaskStackNode<T>, task: Box<dyn FnOnce(Completion<&T>) + Send>) {
+type RefTask<T> = Box<dyn FnOnce(Completion<&T>) + Send>;
+fn rts_invoke_ref<T: Send + Sync>(ref_task_state: Vec<RefTask<T>>, data: &Completion<T>) {
+    let mut iter: IntoIter<RefTask<T>> = ref_task_state.into_iter();
+    while let Some(task) = iter.next() {
         defer! {
-            Self::unwind_panic_all(node);
+            rts_unwind_panic_all(&mut iter);
         }
         task(match data {
             Completion::Taken => Completion::Taken,
@@ -203,17 +197,27 @@ impl<T: Send+Sync> RefTaskState<T> {
             Completion::Value(val_ref) => Completion::Value(val_ref),
         });
     }
-
-    fn invoke_next_ref(data: Completion<&T>, node: &mut TaskStackNode<T>, task: Box<dyn FnOnce(Completion<&T>) + Send>) {
+}
+fn rts_invoke<T: Send + Sync>(ref_task_state: Vec<RefTask<T>>, data: Completion<&T>) {
+    let mut iter: IntoIter<RefTask<T>> = ref_task_state.into_iter();
+    while let Some(task) = iter.next() {
         defer! {
-            Self::unwind_panic_all(node);
+            rts_unwind_panic_all(&mut iter);
         }
         task(data);
     }
 }
 
+fn rts_unwind_panic_all<T: Send + Sync>(iter: &mut IntoIter<RefTask<T>>) {
+    if std::thread::panicking() {
+        while let Some(task) = iter.next() {
+            task(Completion::Panic);
+        }
+    }
+}
+
 #[derive(Debug)]
-struct CompletionStageInner<T: Send+Sync> {
+struct CompletionStageInner<T: Send + Sync> {
     completed: AtomicBool,
     thread_borrow_counts: Mutex<HashMap<ThreadId, usize>>,
     cell: RwLock<CellValue<T>>,
@@ -221,19 +225,31 @@ struct CompletionStageInner<T: Send+Sync> {
     cell_cond: Condvar,
 }
 
-#[derive(Debug)]
-struct CompleteStageInnerTasks<T: Send+Sync> {
-    ref_task_state: RefTaskState<T>,
+
+struct CompleteStageInnerTasks<T: Send + Sync> {
+    ref_task_state: Option<Vec<Box<dyn FnOnce(Completion<&T>) + Send>>>,
     taker: Taker<T>,
 }
 
-fn handle_supplier_panic<T: Send+Sync>(inner: &Arc<CompletionStageInner<T>>) {
+impl<T: Send + Sync> Debug for CompleteStageInnerTasks<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompleteStageInnerTasks")
+            .field("ref_task_state", &self.ref_task_state.as_ref().map(|_|()))
+            .field("taker", &self.taker)
+            .finish()
+    }
+}
+
+fn handle_supplier_panic<T: Send + Sync>(inner: &Arc<CompletionStageInner<T>>) {
     if std::thread::panicking() {
         complete_inner::<T>(inner, Completion::Panic);
     }
 }
 
-fn complete_inner<T: Send+Sync>(inner: &Arc<CompletionStageInner<T>>, data: Completion<T>) -> Option<Completion<T>> {
+fn complete_inner<T: Send + Sync>(
+    inner: &Arc<CompletionStageInner<T>>,
+    data: Completion<T>,
+) -> Option<Completion<T>> {
     if inner.completed.load(SeqCst) {
         return Some(data);
     }
@@ -244,13 +260,15 @@ fn complete_inner<T: Send+Sync>(inner: &Arc<CompletionStageInner<T>>, data: Comp
         return Some(data);
     }
 
-    let rts = mem::replace(&mut inner_state.ref_task_state, RefTaskState::Closed);
 
+    let rts = inner_state.ref_task_state.take()
+        .expect("ref_task_state was none on uncompleted cell");
+    
     if let Some(grd) = inner_state.taker.take() {
         *write_guard = CellValue::Taken;
         drop(inner_state);
         drop(write_guard);
-        rts.invoke_ref(&data);
+        rts_invoke_ref(rts, &data);
         grd(data.into());
         return None;
     }
@@ -269,14 +287,13 @@ fn complete_inner<T: Send+Sync>(inner: &Arc<CompletionStageInner<T>>, data: Comp
     inner.cell_cond.notify_all();
 
     match read_guard.deref() {
-        CellValue::None =>  panic!("read_ref is none"),
-        CellValue::Value(val_ref) => rts.invoke(Completion::Value(val_ref)),
-        //TODO this is unreachable
-        CellValue::DeadLock => rts.invoke(Completion::DeadLock),
-        CellValue::Taken => rts.invoke(Completion::Taken),
-        CellValue::Panic => rts.invoke(Completion::Panic),
+        //We set this to a different value just above and held the lock the entire time.
+        CellValue::None => unreachable!("read_ref is none"),
+        CellValue::Value(val_ref) => rts_invoke(rts, Completion::Value(val_ref)),
+        CellValue::DeadLock => rts_invoke(rts, Completion::DeadLock),
+        CellValue::Taken => rts_invoke(rts, Completion::Taken),
+        CellValue::Panic => rts_invoke(rts, Completion::Panic),
     }
-
 
     None
 }
@@ -285,7 +302,7 @@ fn complete_inner<T: Send+Sync>(inner: &Arc<CompletionStageInner<T>>, data: Comp
 pub enum GetTimeoutResult<T> {
     /// The call would have needed to block longer than intended.
     TimedOut,
-    /// Either a parent stage completed with a DeadLock or
+    /// Either a parent stage completed with a `DeadLock` or
     /// The current thread currently borrows the completed value of the stage.
     /// The call would have therefore resulted in a deadlock
     DeadLock,
@@ -314,27 +331,26 @@ pub enum TryGetResult<T> {
     WouldBlock,
     Taken,
     Panic,
-    Some(T)
+    Some(T),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum TryResult<T> {
     Taken,
     WouldBlock,
-    Value(T)
+    Value(T),
 }
 
-
 #[derive(Debug)]
-pub struct RefGuard<'a, T: Send+Sync>(MappedRwLockReadGuard<'a, T>, Arc<CompletionStageInner<T>>);
+pub struct RefGuard<'a, T: Send + Sync>(MappedRwLockReadGuard<'a, T>, Arc<CompletionStageInner<T>>);
 
-impl<'a, T: Send+Sync> RefGuard<'a, T> {
+impl<'a, T: Send + Sync> RefGuard<'a, T> {
     fn new(guard: MappedRwLockReadGuard<'a, T>, inner: Arc<CompletionStageInner<T>>) -> Self {
         let tid = thread::current().id();
         let mut g2 = inner.thread_borrow_counts.lock();
         if let Some(mt) = g2.get_mut(&tid) {
             assert!(*mt > 0);
-            *mt +=1;
+            *mt += 1;
             drop(g2);
             return Self(guard, inner);
         }
@@ -344,7 +360,7 @@ impl<'a, T: Send+Sync> RefGuard<'a, T> {
     }
 }
 
-impl<'a, T: Send+Sync> Deref for RefGuard<'a, T> {
+impl<T: Send + Sync> Deref for RefGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -352,7 +368,7 @@ impl<'a, T: Send+Sync> Deref for RefGuard<'a, T> {
     }
 }
 
-impl<'a, T: Send+Sync> Drop for RefGuard<'a, T> {
+impl<T: Send + Sync> Drop for RefGuard<'_, T> {
     fn drop(&mut self) {
         let tid = thread::current().id();
         let mut g2 = self.1.thread_borrow_counts.lock();
@@ -367,25 +383,28 @@ impl<'a, T: Send+Sync> Drop for RefGuard<'a, T> {
     }
 }
 
-struct TaskStackNode<T: Send+Sync> {
+/// TODO remove this shit and use a VecDequeue like a sane person would
+struct TaskStackNode<T: Send + Sync> {
+    ///BEEP
     next: Option<Box<TaskStackNode<T>>>,
+    ///BEEP
     task: Option<Box<dyn FnOnce(Completion<&T>) + Send>>,
 }
 
-impl<T: Send+Sync> Debug for TaskStackNode<T> {
+impl<T: Send + Sync> Debug for TaskStackNode<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str("TaskStackNode")
     }
 }
 
-impl<T: Send+Sync + 'static> CompletionStage<T> {
+impl<T: Send + Sync + 'static> CompletionStage<T> {
     pub fn new() -> Self {
         Self(Arc::new(CompletionStageInner {
             completed: Default::default(),
             thread_borrow_counts: Default::default(),
             cell: RwLock::new(CellValue::None),
             tasks: Mutex::new(CompleteStageInnerTasks {
-                ref_task_state: RefTaskState::Empty,
+                ref_task_state: Some(Vec::new()),
                 taker: Taker::None,
             }),
             cell_cond: Condvar::new(),
@@ -407,7 +426,7 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
             thread_borrow_counts: Default::default(),
             cell: RwLock::new(CellValue::Value(data)),
             tasks: Mutex::new(CompleteStageInnerTasks {
-                ref_task_state: RefTaskState::Closed,
+                ref_task_state: None,
                 taker: Taker::Closed,
             }),
             cell_cond: Condvar::new(),
@@ -420,7 +439,7 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
             thread_borrow_counts: Default::default(),
             cell: RwLock::new(CellValue::Taken),
             tasks: Mutex::new(CompleteStageInnerTasks {
-                ref_task_state: RefTaskState::Closed,
+                ref_task_state: None,
                 taker: Taker::Closed,
             }),
             cell_cond: Condvar::new(),
@@ -433,7 +452,7 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
             thread_borrow_counts: Default::default(),
             cell: RwLock::new(CellValue::Panic),
             tasks: Mutex::new(CompleteStageInnerTasks {
-                ref_task_state: RefTaskState::Closed,
+                ref_task_state: None,
                 taker: Taker::Closed,
             }),
             cell_cond: Condvar::new(),
@@ -446,7 +465,7 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
             thread_borrow_counts: Default::default(),
             cell: RwLock::new(CellValue::DeadLock),
             tasks: Mutex::new(CompleteStageInnerTasks {
-                ref_task_state: RefTaskState::Closed,
+                ref_task_state: None,
                 taker: Taker::Closed,
             }),
             cell_cond: Condvar::new(),
@@ -479,7 +498,9 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// }
     /// ```
     ///
-    pub fn new_async_with_error<E: FallibleExecutor<R>, R>(supplier: impl FnOnce()->T + Send+'static) -> Result<Self, R> {
+    pub fn new_async_with_error<E: FallibleExecutor<R>, R>(
+        supplier: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<Self, R> {
         let next_stage = CompletionStage::new();
         let next_inner = next_stage.0.clone();
         E::execute(move || {
@@ -497,7 +518,10 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// # Errors
     /// The executor may return an error to refuse execution. This error is propagated.
     ///
-    pub fn new_async_with_executor<E: InstancedInfallibleExecutor>(executor: E, supplier: impl FnOnce()->T + Send+'static) -> Self {
+    pub fn new_async_with_executor<E: InstancedInfallibleExecutor>(
+        executor: E,
+        supplier: impl FnOnce() -> T + Send + 'static,
+    ) -> Self {
         let next_stage = CompletionStage::new();
         let next_inner = next_stage.0.clone();
         executor.execute(move || {
@@ -515,7 +539,10 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// # Errors
     /// The executor may return an error to refuse execution. This error is propagated.
     ///
-    pub fn new_async_with_executor_and_error<E: InstancedFallibleExecutor<R>, R>(executor: E, supplier: impl FnOnce()->T + Send+'static) -> Result<Self, R> {
+    pub fn new_async_with_executor_and_error<E: InstancedFallibleExecutor<R>, R>(
+        executor: E,
+        supplier: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<Self, R> {
         let next_stage = CompletionStage::new();
         let next_inner = next_stage.0.clone();
         executor.execute(move || {
@@ -530,7 +557,7 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     ///
     /// Create a new stage that completes when the given executor has finished executing the task.
     ///
-    pub fn new_async<E: InfallibleExecutor>(supplier: impl FnOnce()->T + Send+'static) -> Self {
+    pub fn new_async<E: InfallibleExecutor>(supplier: impl FnOnce() -> T + Send + 'static) -> Self {
         let next_stage = CompletionStage::new();
         let next_inner = next_stage.0.clone();
         E::execute(move || {
@@ -595,7 +622,10 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// Beware of the usual limitations that apply during unwinding. (double panic -> abort!)
     /// This is only relevant if unwinding is enabled.
     ///
-    pub fn then_apply_ref<X: Send+Sync>(&self, func: impl FnOnce(Completion<&T>) -> Completion<X> + Send+'static) -> CompletionStage<X> {
+    pub fn then_apply_ref<X: Send + Sync>(
+        &self,
+        func: impl FnOnce(Completion<&T>) -> Completion<X> + Send + 'static,
+    ) -> CompletionStage<X> {
         let next_stage = CompletionStage::new();
         let next_inner = next_stage.0.clone();
 
@@ -609,7 +639,10 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         next_stage
     }
 
-    pub fn then_apply_ref_async<E: InfallibleExecutor, X: Send+Sync>(&self, func: impl FnOnce(Completion<&T>) -> Completion<X> + Send+'static) -> CompletionStage<X> {
+    pub fn then_apply_ref_async<E: InfallibleExecutor, X: Send + Sync>(
+        &self,
+        func: impl FnOnce(Completion<&T>) -> Completion<X> + Send + 'static,
+    ) -> CompletionStage<X> {
         let stage = CompletionStage::new();
         let stage_inner = stage.0.clone();
         self.then_run_ref_async::<E>(move |completion| {
@@ -622,7 +655,11 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         stage
     }
 
-    pub fn then_apply_ref_async_with_executor<X: Send+Sync>(&self, executor: impl InstancedInfallibleExecutor+Send+'static, func: impl FnOnce(Completion<&T>) -> Completion<X> + Send+'static) -> CompletionStage<X> {
+    pub fn then_apply_ref_async_with_executor<X: Send + Sync>(
+        &self,
+        executor: impl InstancedInfallibleExecutor + Send + 'static,
+        func: impl FnOnce(Completion<&T>) -> Completion<X> + Send + 'static,
+    ) -> CompletionStage<X> {
         let stage = CompletionStage::new();
         let stage_inner = stage.0.clone();
         self.then_run_ref_async_with_executor(executor, move |completion| {
@@ -635,7 +672,10 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         stage
     }
 
-    pub fn then_apply_ref_async_with_error<E: FallibleExecutor<R>, X: Send+Sync, R>(&self, func: impl FnOnce(Result<Completion<&T>, R>) -> Completion<X> + Send+'static) -> CompletionStage<X> {
+    pub fn then_apply_ref_async_with_error<E: FallibleExecutor<R>, X: Send + Sync, R>(
+        &self,
+        func: impl FnOnce(Result<Completion<&T>, R>) -> Completion<X> + Send + 'static,
+    ) -> CompletionStage<X> {
         let stage = CompletionStage::new();
         let stage_inner = stage.0.clone();
         self.then_run_ref_async_with_error::<E, R>(move |completion| {
@@ -648,7 +688,11 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         stage
     }
 
-    pub fn then_apply_ref_async_with_executor_and_error<X: Send+Sync, R>(&self, executor: impl InstancedFallibleExecutor<R>+Send+'static, func: impl FnOnce(Result<Completion<&T>, R>) -> Completion<X> + Send+'static) -> CompletionStage<X> {
+    pub fn then_apply_ref_async_with_executor_and_error<X: Send + Sync, R>(
+        &self,
+        executor: impl InstancedFallibleExecutor<R> + Send + 'static,
+        func: impl FnOnce(Result<Completion<&T>, R>) -> Completion<X> + Send + 'static,
+    ) -> CompletionStage<X> {
         let stage = CompletionStage::new();
         let stage_inner = stage.0.clone();
         self.then_run_ref_async_with_executor_and_error(executor, move |completion| {
@@ -661,7 +705,10 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         stage
     }
 
-    pub fn then_apply_async<E: InfallibleExecutor, X: Send+Sync>(&self, func: impl FnOnce(Completion<T>) -> Completion<X> + Send+'static) -> CompletionStage<X> {
+    pub fn then_apply_async<E: InfallibleExecutor, X: Send + Sync>(
+        &self,
+        func: impl FnOnce(Completion<T>) -> Completion<X> + Send + 'static,
+    ) -> CompletionStage<X> {
         let stage = CompletionStage::new();
         let stage_inner = stage.0.clone();
         self.then_run_async::<E>(move |completion| {
@@ -674,7 +721,11 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         stage
     }
 
-    pub fn then_apply_async_with_executor<X: Send+Sync>(&self, executor: impl InstancedInfallibleExecutor+Send+'static, func: impl FnOnce(Completion<T>) -> Completion<X> + Send+'static) -> CompletionStage<X> {
+    pub fn then_apply_async_with_executor<X: Send + Sync>(
+        &self,
+        executor: impl InstancedInfallibleExecutor + Send + 'static,
+        func: impl FnOnce(Completion<T>) -> Completion<X> + Send + 'static,
+    ) -> CompletionStage<X> {
         let stage = CompletionStage::new();
         let stage_inner = stage.0.clone();
         self.then_run_async_with_executor(executor, move |completion| {
@@ -687,7 +738,10 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         stage
     }
 
-    pub fn then_apply_async_with_error<E: FallibleExecutor<R>, X: Send+Sync, R>(&self, func: impl FnOnce(Result<Completion<T>, R>) -> Completion<X> + Send+'static) -> CompletionStage<X> {
+    pub fn then_apply_async_with_error<E: FallibleExecutor<R>, X: Send + Sync, R>(
+        &self,
+        func: impl FnOnce(Result<Completion<T>, R>) -> Completion<X> + Send + 'static,
+    ) -> CompletionStage<X> {
         let stage = CompletionStage::new();
         let stage_inner = stage.0.clone();
         self.then_run_async_with_error::<E, R>(move |completion| {
@@ -700,7 +754,11 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         stage
     }
 
-    pub fn then_apply_async_with_executor_and_error<X: Send+Sync, R>(&self, executor: impl InstancedFallibleExecutor<R>+Send+'static, func: impl FnOnce(Result<Completion<T>, R>) -> Completion<X> + Send+'static) -> CompletionStage<X> {
+    pub fn then_apply_async_with_executor_and_error<X: Send + Sync, R>(
+        &self,
+        executor: impl InstancedFallibleExecutor<R> + Send + 'static,
+        func: impl FnOnce(Result<Completion<T>, R>) -> Completion<X> + Send + 'static,
+    ) -> CompletionStage<X> {
         let stage = CompletionStage::new();
         let stage_inner = stage.0.clone();
         self.then_run_async_with_executor_and_error(executor, move |completion| {
@@ -738,7 +796,10 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// Beware of the usual limitations that apply during unwinding. (double panic -> abort!)
     /// This is only relevant if unwinding is enabled.
     ///
-    pub fn then_apply<X: Send+Sync>(&self, func: impl FnOnce(Completion<T>) -> Completion<X> + Send+'static) -> CompletionStage<X> {
+    pub fn then_apply<X: Send + Sync>(
+        &self,
+        func: impl FnOnce(Completion<T>) -> Completion<X> + Send + 'static,
+    ) -> CompletionStage<X> {
         let next_stage = CompletionStage::new();
         let next_inner = next_stage.0.clone();
         self.then_run(move |completion| {
@@ -751,7 +812,10 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         next_stage
     }
 
-    pub fn then_run_async<E: InfallibleExecutor>(&self, func: impl FnOnce(Completion<T>) +Send+'static) -> &Self {
+    pub fn then_run_async<E: InfallibleExecutor>(
+        &self,
+        func: impl FnOnce(Completion<T>) + Send + 'static,
+    ) -> &Self {
         if self.borrowed_by_current_thread() {
             let scl = self.clone();
             E::execute(move || {
@@ -768,7 +832,11 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         })
     }
 
-    pub fn then_run_async_with_executor(&self, executor: impl InstancedInfallibleExecutor+Send+'static, func: impl FnOnce(Completion<T>) +Send+'static) -> &Self {
+    pub fn then_run_async_with_executor(
+        &self,
+        executor: impl InstancedInfallibleExecutor + Send + 'static,
+        func: impl FnOnce(Completion<T>) + Send + 'static,
+    ) -> &Self {
         if self.borrowed_by_current_thread() {
             let scl = self.clone();
             executor.execute(move || {
@@ -785,7 +853,10 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         })
     }
 
-    pub fn then_run_async_with_error<E: FallibleExecutor<R>, R>(&self, func: impl FnOnce(Result<Completion<T>, R>) +Send+'static) -> &Self {
+    pub fn then_run_async_with_error<E: FallibleExecutor<R>, R>(
+        &self,
+        func: impl FnOnce(Result<Completion<T>, R>) + Send + 'static,
+    ) -> &Self {
         if self.borrowed_by_current_thread() {
             let scl = self.clone();
             let ar = Arc::new(Mutex::new(Some(func)));
@@ -828,7 +899,11 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         })
     }
 
-    pub fn then_run_async_with_executor_and_error<R>(&self, executor: impl InstancedFallibleExecutor<R>+Send+'static, func: impl FnOnce(Result<Completion<T>, R>) +Send+'static) -> &Self {
+    pub fn then_run_async_with_executor_and_error<R>(
+        &self,
+        executor: impl InstancedFallibleExecutor<R> + Send + 'static,
+        func: impl FnOnce(Result<Completion<T>, R>) + Send + 'static,
+    ) -> &Self {
         self.then_run(move |completion| {
             let ar = Arc::new(Mutex::new(Some(func)));
             let cl = ar.clone();
@@ -848,12 +923,15 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         })
     }
 
-    pub fn then_run_ref_async<E: InfallibleExecutor>(&self, func: impl FnOnce(Completion<&T>) +Send+'static) -> &Self {
+    pub fn then_run_ref_async<E: InfallibleExecutor>(
+        &self,
+        func: impl FnOnce(Completion<&T>) + Send + 'static,
+    ) -> &Self {
         let scl = self.clone();
         self.then_run_ref(|_| {
             E::execute(move || {
                 match scl.try_get_ref() {
-                    GetTimeoutResult::TimedOut => unreachable!(),
+                    GetTimeoutResult::TimedOut => unreachable!("then_run_ref_async TimedOut"),
                     GetTimeoutResult::Taken => func(Completion::Taken),
                     GetTimeoutResult::Panic => func(Completion::Panic),
                     GetTimeoutResult::DeadLock => func(Completion::DeadLock),
@@ -861,26 +939,33 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
                 };
             })
         })
-
     }
 
-
-    pub fn then_run_ref_async_with_executor(&self, executor: impl InstancedInfallibleExecutor+Send+'static, func: impl FnOnce(Completion<&T>) +Send+'static) -> &Self {
+    pub fn then_run_ref_async_with_executor(
+        &self,
+        executor: impl InstancedInfallibleExecutor + Send + 'static,
+        func: impl FnOnce(Completion<&T>) + Send + 'static,
+    ) -> &Self {
         let scl = self.clone();
         self.then_run_ref(move |_| {
             executor.execute(move || {
                 match scl.try_get_ref() {
-                    GetTimeoutResult::TimedOut => unreachable!(),
+                    GetTimeoutResult::TimedOut => {
+                        unreachable!("then_run_ref_async_with_executor TimedOut")
+                    }
                     GetTimeoutResult::Taken => func(Completion::Taken),
                     GetTimeoutResult::Panic => func(Completion::Panic),
                     GetTimeoutResult::DeadLock => func(Completion::DeadLock),
-                    GetTimeoutResult::Value(data) => func(Completion::Value(data.deref()))
+                    GetTimeoutResult::Value(data) => func(Completion::Value(data.deref())),
                 };
             });
         })
     }
 
-    pub fn then_run_ref_async_with_error<E: FallibleExecutor<R>, R>(&self, func: impl FnOnce(Result<Completion<&T>, R>) +Send+'static) -> &Self {
+    pub fn then_run_ref_async_with_error<E: FallibleExecutor<R>, R>(
+        &self,
+        func: impl FnOnce(Result<Completion<&T>, R>) + Send + 'static,
+    ) -> &Self {
         let scl = self.clone();
         self.then_run_ref(move |_| {
             let ar = Arc::new(Mutex::new(Some(func)));
@@ -907,7 +992,11 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         })
     }
 
-    pub fn then_run_ref_async_with_executor_and_error<R>(&self, executor: impl InstancedFallibleExecutor<R>+Send+'static, func: impl FnOnce(Result<Completion<&T>, R>) +Send+'static) -> &Self {
+    pub fn then_run_ref_async_with_executor_and_error<R>(
+        &self,
+        executor: impl InstancedFallibleExecutor<R> + Send + 'static,
+        func: impl FnOnce(Result<Completion<&T>, R>) + Send + 'static,
+    ) -> &Self {
         let scl = self.clone();
         self.then_run_ref(move |_| {
             let ar = Arc::new(Mutex::new(Some(func)));
@@ -934,7 +1023,7 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         })
     }
 
-    pub fn then_run_ref(&self, func: impl FnOnce(Completion<&T>) +Send+'static) -> &Self {
+    pub fn then_run_ref(&self, func: impl FnOnce(Completion<&T>) + Send + 'static) -> &Self {
         let mut locked = self.0.tasks.lock();
         let guard = self.0.cell.read_recursive();
         match guard.deref() {
@@ -943,12 +1032,12 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
                 drop(locked);
                 func(Completion::Panic);
                 return self;
-            },
+            }
             CellValue::Taken => {
                 drop(locked);
                 func(Completion::Taken);
                 return self;
-            },
+            }
             CellValue::DeadLock => {
                 drop(locked);
                 func(Completion::DeadLock);
@@ -958,32 +1047,32 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
                 drop(locked);
                 func(Completion::Value(data));
                 return self;
-            },
+            }
         }
         drop(guard);
 
-        let task : Option<Box<dyn FnOnce(Completion<&T>) + Send>> = Some(Box::new(func));
+        let task: Box<dyn FnOnce(Completion<&T>) + Send> = Box::new(func);
 
-        match &mut locked.ref_task_state {
-            RefTaskState::Closed => panic!("ref_task_state closed even tho cell was not empty."),
-            RefTaskState::Empty => {
-                locked.ref_task_state = RefTaskState::Node(TaskStackNode {
-                    next: None,
-                    task,
-                });
-            }
-            RefTaskState::Node(node) => {
-                node.next = Some(Box::new(TaskStackNode {
-                    next: node.next.take(),
-                    task,
-                }));
-            }
-        }
+        let Some(rts) = locked.ref_task_state.as_mut() else {
+            panic!("ref_task_state is none even tho cell was empty.");
+        };
 
+        rts.push(task);
         self
     }
 
-    pub fn then_run(&self, func: impl FnOnce(Completion<T>) +Send+'static) -> &Self {
+    pub fn then_complete<F: From<T>+Sync+Send+'static>(&self, stage: CompletionStage<F>) {
+        self.then_run(move |comp| _= stage.complete(comp.map(F::from)));
+    }
+
+    /// Executes the given closure when this stage completes.
+    /// # Thread of execution
+    /// if the stage is already completed or completion is immediately imminent, then
+    /// the closure is executed in the current thread.
+    /// if the stage is not yet completed then it is executed in the thread that completes the stage.
+    ///
+    /// 
+    pub fn then_run(&self, func: impl FnOnce(Completion<T>) + Send + 'static) -> &Self {
         if self.borrowed_by_current_thread() {
             //Alternatively, we could enqueue the task so its ran when we drop the guard, however
             //that would cause the drop to block if another thread also borrows. No one expects that.
@@ -997,49 +1086,39 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
             CellValue::Panic => {
                 drop(locked);
                 func(Completion::Panic);
-                return self
-            },
+                return self;
+            }
             CellValue::Taken => {
                 drop(locked);
                 func(Completion::Taken);
-                return self
-            },
+                return self;
+            }
             CellValue::DeadLock => {
                 drop(locked);
                 func(Completion::DeadLock);
                 return self;
             }
-            CellValue::Value(data) =>  {
+            CellValue::Value(data) => {
                 drop(locked);
                 func(Completion::Value(data));
-                return self
-            },
+                return self;
+            }
         }
 
         if !locked.taker.is_none() {
-            let task : Option<Box<dyn FnOnce(Completion<&T>) + Send>> = Some(Box::new(move |comp| {
-                _= match comp {
-                    Completion::Taken | Completion::Value(_) => func(Completion::Taken),
-                    Completion::Panic => func(Completion::Panic),
-                    Completion::DeadLock => func(Completion::DeadLock),
-                }
-            }));
+            let task: RefTask<T> =
+                Box::new(move |comp| {
+                    match comp {
+                        Completion::Taken | Completion::Value(_) => func(Completion::Taken),
+                        Completion::Panic => func(Completion::Panic),
+                        Completion::DeadLock => func(Completion::DeadLock),
+                    }
+                });
 
-            match &mut locked.ref_task_state {
-                RefTaskState::Closed => panic!("ref_task_state closed even tho cell was not empty."),
-                RefTaskState::Empty => {
-                    locked.ref_task_state = RefTaskState::Node(TaskStackNode {
-                        next: None,
-                        task,
-                    });
-                }
-                RefTaskState::Node(node) => {
-                    node.next = Some(Box::new(TaskStackNode {
-                        next: node.next.take(),
-                        task,
-                    }));
-                }
-            }
+            let Some(ref_task_state) = locked.ref_task_state.as_mut() else {
+                panic!("ref_task_state is none even tho cell was empty.");
+            };
+            ref_task_state.push(task);
             return self;
         }
 
@@ -1050,80 +1129,64 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     ///
     /// Crates a child stage that will complete after this stage is completed, and an additional task that transforms the intermediary result is completed.
     /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
-    /// 
+    ///
     /// # Order of execution
-    /// Since the closure takes ownership of the value it will only be executed after all 
-    /// other consumers that only consume the 'ref' to the value have been executed. 
+    /// Since the closure takes ownership of the value it will only be executed after all
+    /// other consumers that only consume the 'ref' to the value have been executed.
     /// It doesn't matter if these ref consumers were added before or after
-    /// this function returns. 
-    /// 
+    /// this function returns.
+    ///
     /// # State of self after this call
     /// Since closure takes the ownership of the value 'self' will always complete to taken after this method is called.
     /// It is impossible to take the value out of 'self' after this fn returns.
-    /// 
+    ///
     /// # Thread of execution
     /// If the stage is already completed, the closure is executed in the current thread.
     /// If the stage is not yet completed, then the closure is executed in the thread that will complete the stage.
     ///
     /// # Panics
     /// if the closure is executed immediately and it panics.
-    /// 
-    pub fn and_then_apply<X: Send+Sync>(&self, func: impl FnOnce(T) -> X + Send+'static) -> CompletionStage<X> {
-        self.then_apply(|comp| {
-            match comp {
-                Completion::Value(value) => Completion::Value(func(value)),
-                Completion::Taken => Completion::Taken,
-                Completion::Panic => Completion::Panic,
-                Completion::DeadLock => Completion::DeadLock,
-            }
+    ///
+    pub fn and_then_apply<X: Send + Sync>(
+        &self,
+        func: impl FnOnce(T) -> X + Send + 'static,
+    ) -> CompletionStage<X> {
+        self.then_apply(|comp| comp.map(func))
+    }
+
+    pub fn and_then_apply_async<E: InfallibleExecutor, X: Send + Sync>(
+        &self,
+        func: impl FnOnce(T) -> X + Send + 'static,
+    ) -> CompletionStage<X> {
+        self.then_apply_async::<E, X>(|comp| comp.map(func))
+    }
+
+    pub fn and_then_apply_async_with_error<E: FallibleExecutor<R>, X: Send + Sync, R>(
+        &self,
+        func: impl FnOnce(Result<T, R>) -> X + Send + 'static,
+    ) -> CompletionStage<X> {
+        self.then_apply_async_with_error::<E, X, R>(|comp| match comp {
+            Ok(comp) => comp.map(|v| func(Ok(v))),
+            Err(e) => Completion::Value(func(Err(e))),
         })
     }
 
-    pub fn and_then_apply_async<E: InfallibleExecutor, X: Send+Sync>(&self, func: impl FnOnce(T) -> X + Send+'static) -> CompletionStage<X> {
-        self.then_apply_async::<E, X>(|comp| {
-            match comp {
-                Completion::Value(value) => Completion::Value(func(value)),
-                Completion::Taken => Completion::Taken,
-                Completion::Panic => Completion::Panic,
-                Completion::DeadLock => Completion::DeadLock,
-            }
-        })
+    pub fn and_then_apply_async_with_executor<X: Send + Sync>(
+        &self,
+        executor: impl InstancedInfallibleExecutor + Send + 'static,
+        func: impl FnOnce(T) -> X + Send + 'static,
+    ) -> CompletionStage<X> {
+        self.then_apply_async_with_executor(executor, |comp| comp.map(func))
     }
 
-    pub fn and_then_apply_async_with_error<E: FallibleExecutor<R>, X: Send+Sync, R>(&self, func: impl FnOnce(Result<T, R>) -> X + Send+'static) -> CompletionStage<X> {
-        self.then_apply_async_with_error::<E, X, R>(|comp| {
-            match comp {
-                Ok(Completion::Value(value)) => Completion::Value(func(Ok(value))),
-                Ok(Completion::Taken) => Completion::Taken,
-                Ok(Completion::Panic) => Completion::Panic,
-                Ok(Completion::DeadLock) => Completion::DeadLock,
-                Err(e) => Completion::Value(func(Err(e))),
-
-            }
-        })
-    }
-
-    pub fn and_then_apply_async_with_executor<X: Send+Sync>(&self, executor: impl InstancedInfallibleExecutor+Send+'static,  func: impl FnOnce(T) -> X + Send+'static) -> CompletionStage<X> {
-        self.then_apply_async_with_executor(executor, |comp| {
-            match comp {
-                Completion::Value(value) => Completion::Value(func(value)),
-                Completion::Taken => Completion::Taken,
-                Completion::Panic => Completion::Panic,
-                Completion::DeadLock => Completion::DeadLock,
-
-            }
-        })
-    }
-
-    pub fn and_then_apply_async_with_executor_and_error<X: Send+Sync, R>(&self, executor: impl InstancedFallibleExecutor<R>+Send+'static,  func: impl FnOnce(Result<T, R>) -> X + Send+'static) -> CompletionStage<X> {
-        self.then_apply_async_with_executor_and_error(executor, |comp| {
-            match comp {
-                Ok(Completion::Value(value)) => Completion::Value(func(Ok(value))),
-                Ok(Completion::Taken) => Completion::Taken,
-                Ok(Completion::Panic) => Completion::Panic,
-                Ok(Completion::DeadLock) => Completion::Panic, //I think this is reasonable.
-                Err(e) => Completion::Value(func(Err(e))),
-            }
+    pub fn and_then_apply_async_with_executor_and_error<X: Send + Sync, R>(
+        &self,
+        executor: impl InstancedFallibleExecutor<R> + Send + 'static,
+        func: impl FnOnce(Result<T, R>) -> X + Send + 'static,
+    ) -> CompletionStage<X> {
+        self.then_apply_async_with_executor_and_error(executor, |comp| match comp {
+            Ok(comp) => comp.map(|v| func(Ok(v))),
+            Err(e) => Completion::Value(func(Err(e))),
         })
     }
 
@@ -1142,61 +1205,46 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// # Panics
     /// if the closure is executed immediately and it panics.
     ///
-    pub fn and_then_apply_ref<X: Send+Sync>(&self, func: impl FnOnce(&T) -> X + Send+'static) -> CompletionStage<X> {
-        self.then_apply_ref(|comp| {
-            match comp {
-                Completion::Value(value) => Completion::Value(func(value)),
-                Completion::Taken => Completion::Taken,
-                Completion::Panic => Completion::Panic,
-                Completion::DeadLock => Completion::DeadLock,
-            }
+    pub fn and_then_apply_ref<X: Send + Sync>(
+        &self,
+        func: impl FnOnce(&T) -> X + Send + 'static,
+    ) -> CompletionStage<X> {
+        self.then_apply_ref(|comp| comp.map(func))
+    }
+
+    pub fn and_then_apply_ref_async<E: InfallibleExecutor, X: Send + Sync>(
+        &self,
+        func: impl FnOnce(&T) -> X + Send + 'static,
+    ) -> CompletionStage<X> {
+        self.then_apply_ref_async::<E, X>(|comp| comp.map(func))
+    }
+
+    pub fn and_then_apply_ref_async_with_error<E: FallibleExecutor<R>, X: Send + Sync, R>(
+        &self,
+        func: impl FnOnce(Result<&T, R>) -> X + Send + 'static,
+    ) -> CompletionStage<X> {
+        self.then_apply_ref_async_with_error::<E, X, R>(|comp| match comp {
+            Ok(comp) => comp.map(|v| func(Ok(v))),
+            Err(e) => Completion::Value(func(Err(e))),
         })
     }
 
-    pub fn and_then_apply_ref_async<E: InfallibleExecutor, X: Send+Sync>(&self, func: impl FnOnce(&T) -> X + Send+'static) -> CompletionStage<X> {
-        self.then_apply_ref_async::<E, X>(|comp| {
-            match comp {
-                Completion::Value(value) => Completion::Value(func(value)),
-                Completion::Taken => Completion::Taken,
-                Completion::Panic => Completion::Panic,
-                Completion::DeadLock => Completion::DeadLock,
-            }
-        })
+    pub fn and_then_apply_ref_async_with_executor<X: Send + Sync>(
+        &self,
+        executor: impl InstancedInfallibleExecutor + Send + 'static,
+        func: impl FnOnce(&T) -> X + Send + 'static,
+    ) -> CompletionStage<X> {
+        self.then_apply_ref_async_with_executor(executor, |comp| comp.map(func))
     }
 
-    pub fn and_then_apply_ref_async_with_error<E: FallibleExecutor<R>, X: Send+Sync, R>(&self, func: impl FnOnce(Result<&T, R>) -> X + Send+'static) -> CompletionStage<X> {
-        self.then_apply_ref_async_with_error::<E, X, R>(|comp| {
-            match comp {
-                Ok(Completion::Value(value)) => Completion::Value(func(Ok(value))),
-                Ok(Completion::Taken) => Completion::Taken,
-                Ok(Completion::Panic) => Completion::Panic,
-                Ok(Completion::DeadLock) => Completion::DeadLock,
-                Err(e) => Completion::Value(func(Err(e))),
-
-            }
-        })
-    }
-
-    pub fn and_then_apply_ref_async_with_executor<X: Send+Sync>(&self, executor: impl InstancedInfallibleExecutor+Send+'static,  func: impl FnOnce(&T) -> X + Send+'static) -> CompletionStage<X> {
-        self.then_apply_ref_async_with_executor(executor, |comp| {
-            match comp {
-                Completion::Value(value) => Completion::Value(func(value)),
-                Completion::Taken => Completion::Taken,
-                Completion::Panic => Completion::Panic,
-                Completion::DeadLock => Completion::DeadLock,
-            }
-        })
-    }
-
-    pub fn and_then_apply_ref_async_with_executor_and_error<X: Send+Sync, R>(&self, executor: impl InstancedFallibleExecutor<R>+Send+'static,  func: impl FnOnce(Result<&T, R>) -> X + Send+'static) -> CompletionStage<X> {
-        self.then_apply_ref_async_with_executor_and_error(executor, |comp| {
-            match comp {
-                Ok(Completion::Value(value)) => Completion::Value(func(Ok(value))),
-                Ok(Completion::Taken) => Completion::Taken,
-                Ok(Completion::Panic) => Completion::Panic,
-                Ok(Completion::DeadLock) => Completion::DeadLock,
-                Err(e) => Completion::Value(func(Err(e))),
-            }
+    pub fn and_then_apply_ref_async_with_executor_and_error<X: Send + Sync, R>(
+        &self,
+        executor: impl InstancedFallibleExecutor<R> + Send + 'static,
+        func: impl FnOnce(Result<&T, R>) -> X + Send + 'static,
+    ) -> CompletionStage<X> {
+        self.then_apply_ref_async_with_executor_and_error(executor, |comp| match comp {
+            Ok(comp) => comp.map(|v| func(Ok(v))),
+            Err(e) => Completion::Value(func(Err(e))),
         })
     }
 
@@ -1208,11 +1256,12 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// This function never panics.
     ///
     /// # Returns
-    /// - GetTimeoutResult::TimedOut if blocking for longer would have been required.
-    /// - GetTimeoutResult::Value if the value was successfully taken out of the stage.
-    /// - GetTimeoutResult::Panic if the supplier of the stage panicked.
-    /// - GetTimeoutResult::Taken if the stage already had its value taken previously or by another thread.
+    /// - `GetTimeoutResult::TimedOut` if blocking for longer would have been required.
+    /// - `GetTimeoutResult::Value` if the value was successfully taken out of the stage.
+    /// - `GetTimeoutResult::Panic` if the supplier of the stage panicked.
+    /// - `GetTimeoutResult::Taken` if the stage already had its value taken previously or by another thread.
     ///
+    #[must_use]
     pub fn get_ref_timeout(&self, timeout: Duration) -> GetTimeoutResult<RefGuard<'_, T>> {
         if timeout.is_zero() {
             return self.try_get_ref();
@@ -1229,21 +1278,22 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// This function never panics.
     ///
     /// # Returns
-    /// - GetTimeoutResult::TimedOut if blocking for longer would have been required.
-    /// - GetTimeoutResult::Value if the value was successfully taken out of the stage.
-    /// - GetTimeoutResult::Panic if the supplier of the stage panicked.
-    /// - GetTimeoutResult::Taken if the stage already had its value taken previously or by another thread.
-    /// - GetTimeoutResult::WouldDeadlock if the current thread has the value in the stage borrowed.
+    /// - `GetTimeoutResult::TimedOut` if blocking for longer would have been required.
+    /// - `GetTimeoutResult::Value` if the value was successfully taken out of the stage.
+    /// - `GetTimeoutResult::Panic` if the supplier of the stage panicked.
+    /// - `GetTimeoutResult::Taken` if the stage already had its value taken previously or by another thread.
+    /// - `GetTimeoutResult::DeadLock` if the current thread has the value in the stage borrowed.
     ///
+    #[must_use]
     pub fn get_timeout(&self, timeout: Duration) -> GetTimeoutResult<T> {
         if timeout.is_zero() {
             return self.try_get();
         }
-        
+
         self.get_until(Instant::now() + timeout)
     }
 
-    /// Borrow a refence to the value of the stage without panicking.
+    /// Borrows a refence to the value of the stage without panicking.
     ///
     /// This function may block to wait for the stage to finish completing roughly until the given Instant has arrived.
     ///
@@ -1251,19 +1301,23 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// This function never panics.
     ///
     /// # Returns
-    /// - GetTimeoutResult::TimedOut if blocking for longer would have been required.
-    /// - GetTimeoutResult::Value if the value was successfully taken out of the stage.
-    /// - GetTimeoutResult::Panic if the supplier of the stage panicked.
-    /// - GetTimeoutResult::Taken if the stage already had its value taken previously or by another thread.
+    /// - `GetTimeoutResult::TimedOut` if blocking for longer would have been required.
+    /// - `GetTimeoutResult::Value` if the value was successfully taken out of the stage.
+    /// - `GetTimeoutResult::Panic` if the supplier of the stage panicked.
+    /// - `GetTimeoutResult::DeadLock` if the supplier of the stage deadlocked.
+    /// - `GetTimeoutResult::Taken` if the stage already had its value taken previously or by another thread.
     ///
+    #[must_use]
     pub fn get_ref_until(&self, until: Instant) -> GetTimeoutResult<RefGuard<'_, T>> {
         if self.0.completed.load(SeqCst) {
             match CellValue::map_ref(self.0.cell.read_recursive()) {
                 CellValue::None => (),
                 CellValue::Panic => return GetTimeoutResult::Panic,
                 CellValue::Taken => return GetTimeoutResult::Taken,
-                CellValue::DeadLock => {}
-                CellValue::Value(dta) => return GetTimeoutResult::Value(RefGuard::new(dta, self.0.clone())),
+                CellValue::DeadLock => return GetTimeoutResult::DeadLock,
+                CellValue::Value(dta) => {
+                    return GetTimeoutResult::Value(RefGuard::new(dta, Arc::clone(&self.0)));
+                }
             }
         }
 
@@ -1274,7 +1328,9 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
                 CellValue::Panic => return GetTimeoutResult::Panic,
                 CellValue::Taken => return GetTimeoutResult::Taken,
                 CellValue::DeadLock => return GetTimeoutResult::DeadLock,
-                CellValue::Value(dta) => return GetTimeoutResult::Value(RefGuard::new(dta, self.0.clone())),
+                CellValue::Value(dta) => {
+                    return GetTimeoutResult::Value(RefGuard::new(dta, Arc::clone(&self.0)));
+                }
             }
             if self.0.cell_cond.wait_until(&mut locked, until).timed_out() {
                 return GetTimeoutResult::TimedOut;
@@ -1290,12 +1346,13 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// This function never panics.
     ///
     /// # Returns
-    /// - GetTimeoutResult::TimedOut if blocking for longer would have been required.
-    /// - GetTimeoutResult::Value if the value was successfully taken out of the stage.
-    /// - GetTimeoutResult::Panic if the supplier of the stage panicked.
-    /// - GetTimeoutResult::Taken if the stage already had its value taken previously or by another thread.
-    /// - GetTimeoutResult::WouldDeadlock if the current thread has the value in the stage borrowed.
+    /// - `GetTimeoutResult::TimedOut` if blocking for longer would have been required.
+    /// - `GetTimeoutResult::Value` if the value was successfully taken out of the stage.
+    /// - `GetTimeoutResult::Panic` if the supplier of the stage panicked.
+    /// - `GetTimeoutResult::Taken` if the stage already had its value taken previously or by another thread.
+    /// - `GetTimeoutResult::DeadLock` if the current thread has the value in the stage borrowed.
     ///
+    #[must_use]
     pub fn get_until(&self, until: Instant) -> GetTimeoutResult<T> {
         if self.borrowed_by_current_thread() {
             return GetTimeoutResult::DeadLock;
@@ -1335,21 +1392,22 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     ///
     ///
     /// # Returns
-    /// - GetTimeoutResult::TimedOut if blocking would have been required
-    /// - GetTimeoutResult::Value if the value was successfully taken out of the stage.
-    /// - GetTimeoutResult::Panic if the supplier of the stage panicked.
-    /// - GetTimeoutResult::Taken if a reference to the stages was successfully created.
+    /// - `GetTimeoutResult::TimedOut` if blocking would have been required
+    /// - `GetTimeoutResult::Value` if the value was successfully taken out of the stage.
+    /// - `GetTimeoutResult::Panic` if the supplier of the stage panicked.
+    /// - `GetTimeoutResult::Taken` if a reference to the stages was successfully created.
     ///
+    #[must_use]
     pub fn try_get_ref(&self) -> GetTimeoutResult<RefGuard<'_, T>> {
         if !self.0.completed.load(SeqCst) {
-            return GetTimeoutResult::TimedOut
+            return GetTimeoutResult::TimedOut;
         }
         match CellValue::map_ref(self.0.cell.read_recursive()) {
             CellValue::None => GetTimeoutResult::TimedOut,
             CellValue::Panic => GetTimeoutResult::Panic,
             CellValue::Taken => GetTimeoutResult::Taken,
             CellValue::DeadLock => GetTimeoutResult::DeadLock,
-            CellValue::Value(dta) => GetTimeoutResult::Value(RefGuard::new(dta, self.0.clone())),
+            CellValue::Value(dta) => GetTimeoutResult::Value(RefGuard::new(dta, Arc::clone(&self.0))),
         }
     }
 
@@ -1359,10 +1417,12 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// This function never panics.
     ///
     /// # Returns
-    /// - GetRefResult::Value if the value was successfully taken out of the stage.
-    /// - GetRefResult::Panic if the supplier of the stage panicked.
-    /// - GetRefResult::Taken if a reference to the stages was successfully created.
+    /// - `GetRefResult::Value` if the value was successfully taken out of the stage.
+    /// - `GetRefResult::Panic` if the supplier of the stage panicked.
+    /// - `GetRefResult::Taken` if a reference to the stages was successfully created.
+    /// - `GetRefResult::DeadLock` if the supplier of the stage deadlocked.
     ///
+    #[must_use]
     pub fn get_ref(&self) -> Completion<RefGuard<'_, T>> {
         if self.0.completed.load(SeqCst) {
             match CellValue::map_ref(self.0.cell.read_recursive()) {
@@ -1370,7 +1430,9 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
                 CellValue::Panic => return Completion::Panic,
                 CellValue::Taken => return Completion::Taken,
                 CellValue::DeadLock => return Completion::DeadLock,
-                CellValue::Value(guard) => return Completion::Value(RefGuard::new(guard, self.0.clone())),
+                CellValue::Value(guard) => {
+                    return Completion::Value(RefGuard::new(guard, Arc::clone(&self.0)));
+                }
             }
         }
 
@@ -1381,7 +1443,9 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
                 CellValue::Panic => return Completion::Panic,
                 CellValue::Taken => return Completion::Taken,
                 CellValue::DeadLock => return Completion::DeadLock,
-                CellValue::Value(guard) => return Completion::Value(RefGuard::new(guard, self.0.clone())),
+                CellValue::Value(guard) => {
+                    return Completion::Value(RefGuard::new(guard, Arc::clone(&self.0)));
+                }
             }
             self.0.cell_cond.wait(&mut locked);
         }
@@ -1393,12 +1457,13 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// This function never panics.
     ///
     /// # Returns
-    /// - GetTimeoutResult::TimedOut if blocking would have been required
-    /// - GetTimeoutResult::Value if the value was successfully taken out of the stage.
-    /// - GetTimeoutResult::Panic if the supplier of the stage panicked.
-    /// - GetTimeoutResult::Taken if the stage already had its value taken previously or by another thread.
-    /// - GetTimeoutResult::WouldDeadlock if the current thread has the value in the stage borrowed.
+    /// - `GetTimeoutResult::TimedOut` if blocking would have been required
+    /// - `GetTimeoutResult::Value` if the value was successfully taken out of the stage.
+    /// - `GetTimeoutResult::Panic` if the supplier of the stage panicked.
+    /// - `GetTimeoutResult::Taken` if the stage already had its value taken previously or by another thread.
+    /// - `GetTimeoutResult::DeadLock` if the current thread has the value in the stage borrowed or a supplier deadlocked.
     ///
+    #[must_use]
     pub fn try_get(&self) -> GetTimeoutResult<T> {
         if !self.0.completed.load(SeqCst) {
             return GetTimeoutResult::TimedOut;
@@ -1424,14 +1489,15 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// This function never panics.
     ///
     /// # Returns
-    /// - TakenCompletion::Value if the value was successfully taken out of the stage.
-    /// - TakenCompletion::Panic if the supplier of the stage panicked.
-    /// - TakenCompletion::Taken if the stage already had its value taken previously or by another thread.
-    /// - TakenCompletion::WouldDeadlock if the current thread has the value in the stage borrowed.
+    /// - `Completion::Value` if the value was successfully taken out of the stage.
+    /// - `Completion::Panic` if the supplier of the stage panicked.
+    /// - `Completion::Taken` if the stage already had its value taken previously or by another thread.
+    /// - `Completion::WouldDeadlock` if the current thread has the value in the stage borrowed.
     ///
+    #[must_use]
     pub fn get(&self) -> Completion<T> {
         if self.borrowed_by_current_thread() {
-           return Completion::DeadLock;
+            return Completion::DeadLock;
         }
 
         if self.0.completed.load(SeqCst) {
@@ -1458,14 +1524,18 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
             self.0.cell_cond.wait(&mut locked);
         }
     }
-    
-    /// 
+
+    ///
     /// Attempts to return a reference to the result of the stage without blocking for a significant amount of time.
     /// This function may still block for an insignificant amount of time when completion of the sage is imminent.
-    /// 
-    /// If the stage is yet completed and completion is not immediately imminent, 
-    /// then this function returns TryResult::WouldBlock
-    /// 
+    ///
+    /// If the stage is yet completed and completion is not immediately imminent,
+    /// then this function returns `TryResult::WouldBlock`
+    ///
+    /// # Panics
+    /// if the supplier of the stage either panicked or deadlocked.
+    ///
+    #[must_use]
     pub fn try_borrow(&self) -> TryResult<RefGuard<'_, T>> {
         if !self.0.completed.load(SeqCst) {
             return TryResult::WouldBlock;
@@ -1476,24 +1546,25 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
             CellValue::Taken => TryResult::Taken,
             CellValue::Panic => panic!("supplier panicked"),
             CellValue::DeadLock => panic!("stage deadlocked"),
-            CellValue::Value(guard) => TryResult::Value(RefGuard::new(guard, self.0.clone())),
+            CellValue::Value(guard) => TryResult::Value(RefGuard::new(guard, Arc::clone(&self.0))),
         }
     }
 
     ///
     /// Blocks until stage resolves and returns a reference to the result of the stage.
-    /// 
+    ///
     /// # Panics
-    /// if the supplier of this stage panics
-    /// 
+    /// if the supplier of this stage panics or a deadlock occurred.
+    ///
     /// # None
     /// if the stage has been completed and ownership of the value was taken out of the stage.
-    /// 
+    ///
     /// # Some
-    /// if the stage has been completed and a ReadLock on a non-taken value was obtained.
-    /// The ReadLock is relinquished once the returned guard is dropped.
-    /// While the ReadLock is held, the value cannot be taken out of the stage.
-    /// 
+    /// if the stage has been completed and a `ReadLock` on a non-taken value was obtained.
+    /// The `ReadLock` is relinquished once the returned guard is dropped.
+    /// While the `ReadLock` is held, the value cannot be taken out of the stage.
+    ///
+    #[must_use]
     pub fn borrow(&self) -> Option<RefGuard<'_, T>> {
         if self.0.completed.load(SeqCst) {
             match CellValue::map_ref(self.0.cell.read_recursive()) {
@@ -1501,7 +1572,7 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
                 CellValue::Taken => return None,
                 CellValue::Panic => panic!("supplier panicked"),
                 CellValue::DeadLock => panic!("stage deadlocked"),
-                CellValue::Value(guard) => return Some(RefGuard::new(guard, self.0.clone())),
+                CellValue::Value(guard) => return Some(RefGuard::new(guard, Arc::clone(&self.0))),
             }
         }
 
@@ -1512,7 +1583,7 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
                 CellValue::Taken => return None,
                 CellValue::Panic => panic!("supplier panicked"),
                 CellValue::DeadLock => panic!("stage deadlocked"),
-                CellValue::Value(guard) => return Some(RefGuard::new(guard, self.0.clone())),
+                CellValue::Value(guard) => return Some(RefGuard::new(guard, Arc::clone(&self.0))),
             }
             self.0.cell_cond.wait(&mut locked);
         }
@@ -1526,22 +1597,21 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// - if the current thread also has the result of the stage borrowed, causing a deadlock.
     ///
     /// # Returns
-    /// TryResult::WouldBlock - if the stage has not yet completed.
-    /// TryResult::Taken - if the value has already been taken out of the stage
-    /// TryResult::Value - if the value was successfully taken out of the stage
+    /// `TryResult::WouldBlock` - if the stage has not yet completed.
+    /// `TryResult::Taken` - if the value has already been taken out of the stage
+    /// `TryResult::Value` - if the value was successfully taken out of the stage
     ///
     ///
+    #[must_use]
     pub fn try_take(&self) -> TryResult<T> {
         if !self.0.completed.load(SeqCst) {
             return TryResult::WouldBlock;
         }
 
-        if self.borrowed_by_current_thread() {
-            panic!("deadlock detected");
-        }
+        assert!(!self.borrowed_by_current_thread());
 
         let taken = self.0.cell.write().take();
-        
+
         match taken {
             CellValue::None => TryResult::WouldBlock,
             CellValue::Taken => TryResult::Taken,
@@ -1552,8 +1622,9 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     }
 
     /// This function tries to take the value from the stage and place it into the given mutable reference.
-    /// The returned Value in the TryResult is not the value from the stage but rather the value
+    /// The returned Value in the `TryResult` is not the value from the stage but rather the value
     /// that was stored in the reference previously.
+    #[must_use]
     pub fn try_take_into(&self, into: &mut T) -> TryResult<T> {
         match self.try_take() {
             TryResult::Value(v) => TryResult::Value(mem::replace(into, v)),
@@ -1562,8 +1633,12 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     }
 
     ///
-    /// Same as calling take().unwrap()
+    /// Same as calling `self.take().unwrap()`
     ///
+    /// # Panics
+    /// whenever `self.take()` returns none
+    ///
+    #[must_use]
     pub fn unwrap(&self) -> T {
         self.take().expect("value already taken from stage")
     }
@@ -1578,10 +1653,9 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
     /// - Some - if the value was taken from the stage
     /// - None - if the value was already taken by a previous call or another thread.
     ///
+    #[must_use]
     pub fn take(&self) -> Option<T> {
-        if self.borrowed_by_current_thread() {
-            panic!("deadlock detected");
-        }
+        assert!(!self.borrowed_by_current_thread(), "deadlock detected");
 
         if self.0.completed.load(SeqCst) {
             let taken = self.0.cell.write().take();
@@ -1608,129 +1682,130 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         }
     }
 
-
-
     /// Returns true if the value has already been taken out of the stage or if the value will be taken immediately by a child stage once the stage completed.
+    #[must_use]
     pub fn taken(&self) -> bool {
         if self.borrowed_by_current_thread() {
             return false;
         }
 
         let guard = self.0.cell.read_recursive();
-        if matches!(guard.deref(), CellValue::Taken) {
+        if matches!(&*guard, CellValue::Taken) {
             return true;
         }
         drop(guard);
-
 
         let locked = self.0.tasks.lock();
         if matches!(locked.taker, Taker::Some(_)) {
             return true;
         }
+        drop(locked);
 
         false
     }
 
     /// Returns true if the stage is either completed or completion is immediately imminent
+    #[must_use]
     pub fn completed(&self) -> bool {
         self.0.completed.load(SeqCst)
     }
 
+    /// Returns true if the current thread currently borrows the result of the stage.
+    #[must_use]
     pub fn borrowed_by_current_thread(&self) -> bool {
-        self.0.thread_borrow_counts.lock().contains_key(&std::thread::current().id())
+        self.0
+            .thread_borrow_counts
+            .lock()
+            .contains_key(&std::thread::current().id())
     }
 
-    pub fn compose<Y>(&self, func: impl FnOnce(&CompletionStage<T>) -> Y) -> &Self {
-        _= func(self);
+    pub fn compose<Y>(&self, func: impl FnOnce(&Self) -> Y) -> &Self {
+        _ = func(self);
         self
     }
 
-    pub fn then_compose<X: Sync+Send>(&self, func: impl FnOnce(Completion<T>) -> CompletionStage<X>+'static+Send) -> CompletionStage<X> {
+    pub fn then_compose<X: Sync + Send>(
+        &self,
+        func: impl FnOnce(Completion<T>) -> CompletionStage<X> + 'static + Send,
+    ) -> CompletionStage<X> {
         let new_stage = CompletionStage::new();
         let ncl = new_stage.clone();
         self.then_run(move |comp| {
-            func(comp).then_run(move |comp| {
-                match comp {
-                    Completion::Taken => _= ncl.complete(Completion::Taken),
-                    Completion::Panic => _= ncl.complete(Completion::Panic),
-                    Completion::Value(v) => _= ncl.complete_with_value(v),
-                    Completion::DeadLock => _= ncl.complete(Completion::DeadLock),
-                }
+            func(comp).then_run(move |comp| match comp {
+                Completion::Taken => _ = ncl.complete(Completion::Taken),
+                Completion::Panic => _ = ncl.complete(Completion::Panic),
+                Completion::Value(v) => _ = ncl.complete_with_value(v),
+                Completion::DeadLock => _ = ncl.complete(Completion::DeadLock),
             });
         });
 
         new_stage
     }
 
-    pub fn then_compose_async<E: InfallibleExecutor, X: Sync+Send>(&self, func: impl FnOnce(Completion<T>) -> CompletionStage<X>+'static+Send) -> CompletionStage<X> {
+    pub fn then_compose_async<E: InfallibleExecutor, X: Sync + Send>(
+        &self,
+        func: impl FnOnce(Completion<T>) -> CompletionStage<X> + 'static + Send,
+    ) -> CompletionStage<X> {
         let new_stage = CompletionStage::new();
         let ncl = new_stage.clone();
         self.then_run(move |comp| {
-            func(comp).then_run_async::<E>(move |comp| {
-                match comp {
-                    Completion::Taken => _= ncl.complete(Completion::Taken),
-                    Completion::Panic => _= ncl.complete(Completion::Panic),
-                    Completion::Value(v) => _= ncl.complete_with_value(v),
-                    Completion::DeadLock => _= ncl.complete(Completion::DeadLock),
-                }
+            func(comp).then_run_async::<E>(move |comp| match comp {
+                Completion::Taken => _ = ncl.complete(Completion::Taken),
+                Completion::Panic => _ = ncl.complete(Completion::Panic),
+                Completion::Value(v) => _ = ncl.complete_with_value(v),
+                Completion::DeadLock => _ = ncl.complete(Completion::DeadLock),
             });
         });
 
         new_stage
     }
 
-    pub fn then_compose_async_with_executor<X: Sync+Send>(&self, executor: impl InstancedInfallibleExecutor+Send+'static, func: impl FnOnce(Completion<T>) -> CompletionStage<X>+'static+Send) -> CompletionStage<X> {
+    pub fn then_compose_async_with_executor<X: Sync + Send>(
+        &self,
+        executor: impl InstancedInfallibleExecutor + Send + 'static,
+        func: impl FnOnce(Completion<T>) -> CompletionStage<X> + 'static + Send,
+    ) -> CompletionStage<X> {
         let new_stage = CompletionStage::new();
         let ncl = new_stage.clone();
         self.then_run_async_with_executor(executor, move |comp| {
-            func(comp).then_run(move |comp| {
-                match comp {
-                    Completion::Taken => _= ncl.complete(Completion::Taken),
-                    Completion::Panic => _= ncl.complete(Completion::Panic),
-                    Completion::Value(v) => _= ncl.complete_with_value(v),
-                    Completion::DeadLock => _= ncl.complete(Completion::Panic), //Should be unreachable!
-                }
-            });
+            func(comp).then_complete(ncl);
         });
 
         new_stage
     }
 
-    pub fn then_compose_async_with_error<E: FallibleExecutor<R>, X: Sync+Send, R>(&self, func: impl FnOnce(Result<Completion<T>, R>) -> CompletionStage<X>+'static+Send) -> CompletionStage<X> {
+    pub fn then_compose_async_with_error<E: FallibleExecutor<R>, X: Sync + Send, R>(
+        &self,
+        func: impl FnOnce(Result<Completion<T>, R>) -> CompletionStage<X> + 'static + Send,
+    ) -> CompletionStage<X> {
         let new_stage = CompletionStage::new();
         let ncl = new_stage.clone();
         self.then_run_async_with_error::<E, R>(move |comp| {
-            func(comp).then_run(move |comp| {
-                match comp {
-                    Completion::Taken => _= ncl.complete(Completion::Taken),
-                    Completion::Panic => _= ncl.complete(Completion::Panic),
-                    Completion::Value(v) => _= ncl.complete_with_value(v),
-                    Completion::DeadLock => _= ncl.complete(Completion::Panic), //Should be unreachable!
-                }
-            });
+            func(comp).then_complete(ncl);
         });
 
         new_stage
     }
 
-    pub fn then_compose_async_with_executor_and_error<X: Sync+Send, R>(&self, executor: impl InstancedFallibleExecutor<R>+Send+'static, func: impl FnOnce(Result<Completion<T>, R>) -> CompletionStage<X>+'static+Send) -> CompletionStage<X> {
+    pub fn then_compose_async_with_executor_and_error<X: Sync + Send, R>(
+        &self,
+        executor: impl InstancedFallibleExecutor<R> + Send + 'static,
+        func: impl FnOnce(Result<Completion<T>, R>) -> CompletionStage<X> + 'static + Send,
+    ) -> CompletionStage<X> {
         let new_stage = CompletionStage::new();
         let ncl = new_stage.clone();
         self.then_run_async_with_executor_and_error(executor, move |comp| {
-            func(comp).then_run(move |comp| {
-                match comp {
-                    Completion::Taken => _= ncl.complete(Completion::Taken),
-                    Completion::Panic => _= ncl.complete(Completion::Panic),
-                    Completion::Value(v) => _= ncl.complete_with_value(v),
-                    Completion::DeadLock => _= ncl.complete(Completion::Panic), //Should be unreachable!
-                }
-            });
+            func(comp).then_complete(ncl);
         });
 
         new_stage
     }
 
-    pub fn then_combine<X: Send+Sync, Y: Send+Sync>(&self, other: &CompletionStage<X>, func: impl FnOnce(Completion<T>, Completion<X>) -> Completion<Y>+'static+Send) -> CompletionStage<Y> {
+    pub fn then_combine<X: Send + Sync, Y: Send + Sync>(
+        &self,
+        other: &CompletionStage<X>,
+        func: impl FnOnce(Completion<T>, Completion<X>) -> Completion<Y> + 'static + Send,
+    ) -> CompletionStage<Y> {
         let stage = CompletionStage::new();
         let scl = stage.clone();
         let ocl = other.clone();
@@ -1743,33 +1818,36 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
         stage
     }
 
-    pub fn any_of(&self, any: &[CompletionStage<T>]) -> CompletionStage<T> {
-        let new_stage = CompletionStage::new();
+    /// Returns a completion stage that completes when any of the given stages completes.
+    #[must_use]
+    pub fn any_of(&self, any: &[Self]) -> Self {
+        let new_stage = Self::new();
         for stage in any {
             if new_stage.completed() {
                 return new_stage;
             }
-            
+
             if stage.completed() {
-                new_stage.complete(stage.get().try_into().unwrap_or(Completion::Panic));
+                new_stage.complete(stage.get());
                 return new_stage;
             }
 
-            let scl = new_stage.clone();
-            stage.then_run(move |comp| {
-                scl.complete(comp.try_into().unwrap_or(Completion::Panic));
-            });
+            stage.then_complete(new_stage.clone());
         }
 
         new_stage
     }
 
-    pub fn all_of(&self, all: &[CompletionStage<T>]) -> CompletionStage<Vec<Completion<T>>> {
+    /// Returns a completion stage that completes when all given stages are completed.
+    ///
+    /// The returned stage completes with a Vec that has the same order as the input slice.
+    #[must_use]
+    pub fn all_of(&self, all: &[Self]) -> CompletionStage<Vec<Completion<T>>> {
         let new_stage = CompletionStage::new();
         let all_len = all.len();
         let result = Arc::new(Mutex::new(Vec::<Completion<T>>::new()));
         for stage in all {
-            let cp = result.clone();
+            let cp = Arc::clone(&result);
             let scl = new_stage.clone();
             stage.then_run(move |comp| {
                 let mut guard = cp.lock();
@@ -1777,41 +1855,51 @@ impl<T: Send+Sync + 'static> CompletionStage<T> {
                     Completion::Taken => Completion::Taken,
                     Completion::Panic => Completion::Panic,
                     Completion::Value(v) => Completion::Value(v),
-                    Completion::DeadLock => Completion::Panic,
+                    Completion::DeadLock => Completion::DeadLock,
                 });
 
                 if guard.len() == all_len {
-                    scl.complete_with_value(mem::take(guard.deref_mut()));
+                    scl.complete_with_value(mem::take(&mut *guard));
                 }
             });
         }
 
         new_stage
     }
-
-
 }
 
 /// Static Executor that can only fail to execute something by panicking
 pub trait InfallibleExecutor {
-    fn execute(task: impl FnOnce() + Send+'static);
+    fn execute(task: impl FnOnce() + Send + 'static);
 }
 
 /// Static Executor that can fail with a given error when trying to execute something.
 /// Error refers to an OS error like "I cannot spawn more threads" rather than any error the task may produce
 pub trait FallibleExecutor<R> {
-    fn execute(task: impl FnOnce() + Send+'static) -> Result<(), R>;
+
+    /// Execute the given or schedule it for execution
+    ///
+    /// # Errors
+    /// If execution of the task could not be started because of, for example, os' limits on threads.
+    fn execute(task: impl FnOnce() + Send + 'static) -> Result<(), R>;
 }
 
 /// Executor that can only fail to execute something by panicking
 pub trait InstancedInfallibleExecutor {
-    fn execute(self, task: impl FnOnce() + Send+'static);
+
+    /// Execute the given or schedule it for execution
+    fn execute(self, task: impl FnOnce() + Send + 'static);
 }
 
 /// Executor that can fail with a given error when trying to execute something.
 /// Error refers to an OS error like "I cannot spawn more threads" rather than any error the task may produce
-pub trait InstancedFallibleExecutor<R>: Send {
-    fn execute(self, task: impl FnOnce() + Send+'static) -> Result<(), R>;
+pub trait InstancedFallibleExecutor<R> {
+
+    /// Execute the given or schedule it for execution
+    ///
+    /// # Errors
+    /// If execution of the task could not be started because of, for example, os' limits on threads.
+    fn execute(self, task: impl FnOnce() + Send + 'static) -> Result<(), R>;
 }
 
 impl InfallibleExecutor for thread::Thread {
@@ -1822,7 +1910,7 @@ impl InfallibleExecutor for thread::Thread {
 
 impl FallibleExecutor<Error> for thread::Builder {
     fn execute(task: impl FnOnce() + Send + 'static) -> Result<(), Error> {
-        thread::Builder::new().spawn(task).map(|_| ())
+        Self::new().spawn(task).map(|_| ())
     }
 }
 

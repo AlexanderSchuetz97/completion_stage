@@ -9,7 +9,7 @@ fn test() {
         456
     });
     assert!(stage.taken());
-        
+
     assert!(!stage.completed());
     assert!(!stage2.completed());
     stage.complete_with_value(123);

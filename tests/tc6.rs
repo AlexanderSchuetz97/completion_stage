@@ -8,6 +8,9 @@ fn test() {
         thread::sleep(Duration::from_millis(2000));
     });
     assert!(!n.completed());
-    matches!(n.get_timeout(Duration::from_millis(500)), GetTimeoutResult::TimedOut);
-    _= n.get_timeout(Duration::from_millis(1800)).unwrap();
+    matches!(
+        n.get_timeout(Duration::from_millis(500)),
+        GetTimeoutResult::TimedOut
+    );
+    _ = n.get_timeout(Duration::from_millis(1800)).unwrap();
 }
