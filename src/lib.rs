@@ -57,9 +57,9 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::io::Error;
 use std::ops::Deref;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
+use std::sync::Arc;
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 use std::vec::IntoIter;
@@ -2303,13 +2303,14 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
 
 /// Static Executor that can only fail to execute something by panicking
 pub trait InfallibleExecutor {
+    /// Execute the given task or schedule it for execution
     fn execute(task: impl FnOnce() + Send + 'static);
 }
 
 /// Static Executor that can fail with a given error when trying to execute something.
 /// Error refers to an OS error like "I cannot spawn more threads" rather than any error the task may produce
 pub trait FallibleExecutor<R> {
-    /// Execute the given or schedule it for execution
+    /// Execute the given task or schedule it for execution
     ///
     /// # Errors
     /// If execution of the task could not be started because of, for example, os' limits on threads.
@@ -2325,7 +2326,7 @@ pub trait InstancedInfallibleExecutor {
 /// Executor that can fail with a given error when trying to execute something.
 /// Error refers to an OS error like "I cannot spawn more threads" rather than any error the task may produce
 pub trait InstancedFallibleExecutor<R> {
-    /// Execute the given or schedule it for execution
+    /// Execute the given task or schedule it for execution
     ///
     /// # Errors
     /// If execution of the task could not be started because of, for example, os' limits on threads.
