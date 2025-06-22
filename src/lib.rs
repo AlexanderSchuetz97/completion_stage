@@ -44,8 +44,10 @@
     clippy::multiple_inherent_impl,
     clippy::unwrap_used,
     clippy::cargo_common_metadata,
-    clippy::used_underscore_binding
+    clippy::used_underscore_binding,
+    unsafe_code, 
 )]
+
 use defer_heavy::defer;
 use parking_lot::{
     Condvar, MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -967,6 +969,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         next_stage
     }
 
+    /// Run the given closure once this stage completes using the provided executor
     pub fn then_run_async<E: InfallibleExecutor>(
         &self,
         func: impl FnOnce(Completion<T>) + Send + 'static,
@@ -987,6 +990,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         })
     }
 
+    /// Run the given closure once this stage completes using the provided executor
     pub fn then_run_async_with_executor(
         &self,
         executor: impl InstancedInfallibleExecutor + Send + 'static,
@@ -1198,6 +1202,12 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         })
     }
 
+    /// Executes the given closure when this stage completes.
+    /// # Thread of execution
+    /// if the stage is already completed or completion is immediately imminent, then
+    /// the closure is executed in the current thread.
+    /// if the stage is not yet completed then it is executed in the thread that completes the stage.
+    ///
     pub fn then_run_ref(&self, func: impl FnOnce(Completion<&T>) + Send + 'static) -> &Self {
         self.then_run_ref_internal(move |comp, _| {
             func(comp);
@@ -1255,6 +1265,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         self
     }
 
+    /// Complete the given stage once this stage completes.
     pub fn then_complete<F: From<T> + Sync + Send + 'static>(&self, stage: CompletionStage<F>) {
         self.then_run_internal(move |comp, q| {
             complete_inner_queue(&stage.0, comp.map(F::from), q);
@@ -1430,6 +1441,13 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         self.then_apply(|comp| comp.map(func))
     }
 
+    /// Crates a child stage that will complete after this stage is completed, and an additional task that transforms the intermediary result is completed.
+    /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
+    ///
+    /// The closure is executed using the given executor.
+    /// 
+    /// # Panics
+    /// If the executor panics.
     pub fn and_then_apply_async<E: InfallibleExecutor, X: Send + Sync>(
         &self,
         func: impl FnOnce(T) -> X + Send + 'static,
@@ -1437,6 +1455,15 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         self.then_apply_async::<E, X>(|comp| comp.map(func))
     }
 
+    /// Crates a child stage that will complete after this stage is completed, and an additional task that transforms the intermediary result is completed.
+    /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
+    ///
+    /// The closure is executed using the given executor
+    /// If the executor errors then the closure is executed with the error in the current thread.
+    /// 
+    /// # Panics
+    /// If the closure is executed in the current thread and it panics.
+    /// If the executor panics.
     pub fn and_then_apply_async_with_error<E: FallibleExecutor<R>, X: Send + Sync, R>(
         &self,
         func: impl FnOnce(Result<T, R>) -> X + Send + 'static,
@@ -1447,6 +1474,13 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         })
     }
 
+    /// Crates a child stage that will complete after this stage is completed, and an additional task that transforms the intermediary result is completed.
+    /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
+    ///
+    /// The closure is executed using the given executor.
+    /// 
+    /// # Panics
+    /// If the executor panics.
     pub fn and_then_apply_async_with_executor<X: Send + Sync>(
         &self,
         executor: impl InstancedInfallibleExecutor + Send + 'static,
@@ -1455,6 +1489,15 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         self.then_apply_async_with_executor(executor, |comp| comp.map(func))
     }
 
+    /// Crates a child stage that will complete after this stage is completed, and an additional task that transforms the intermediary result is completed.
+    /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
+    ///
+    /// The closure is executed using the given executor.
+    /// If the executor errors then the closure is executed with the error in the current thread.
+    /// 
+    /// # Panics
+    /// If the closure is executed in the current thread and it panics.
+    /// If the executor panics.
     pub fn and_then_apply_async_with_executor_and_error<X: Send + Sync, R>(
         &self,
         executor: impl InstancedFallibleExecutor<R> + Send + 'static,
@@ -1488,6 +1531,13 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         self.then_apply_ref(|comp| comp.map(func))
     }
 
+    /// Crates a child stage that will complete after this stage is completed, and an additional task that transforms the intermediary result is completed.
+    /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
+    ///
+    /// The closure is executed using the given executor
+    ///
+    /// # Panics
+    /// If the executor panics.
     pub fn and_then_apply_ref_async<E: InfallibleExecutor, X: Send + Sync>(
         &self,
         func: impl FnOnce(&T) -> X + Send + 'static,
@@ -1495,6 +1545,14 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         self.then_apply_ref_async::<E, X>(|comp| comp.map(func))
     }
 
+    /// Crates a child stage that will complete after this stage is completed, and an additional task that transforms the intermediary result is completed.
+    /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
+    ///
+    /// The closure is executed using the given executor
+    /// 
+    /// # Panics
+    /// If the closure is executed in the current thread and it panics.
+    /// If the executor panics.
     pub fn and_then_apply_ref_async_with_error<E: FallibleExecutor<R>, X: Send + Sync, R>(
         &self,
         func: impl FnOnce(Result<&T, R>) -> X + Send + 'static,
@@ -1505,6 +1563,13 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         })
     }
 
+    /// Crates a child stage that will complete after this stage is completed, and an additional task that transforms the intermediary result is completed.
+    /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
+    ///
+    /// The closure is executed using the given executor
+    /// 
+    /// # Panics
+    /// If the executor panics.
     pub fn and_then_apply_ref_async_with_executor<X: Send + Sync>(
         &self,
         executor: impl InstancedInfallibleExecutor + Send + 'static,
@@ -1513,6 +1578,14 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         self.then_apply_ref_async_with_executor(executor, |comp| comp.map(func))
     }
 
+    /// Crates a child stage that will complete after this stage is completed, and an additional task that transforms the intermediary result is completed.
+    /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
+    ///
+    /// The closure is executed using the given executor
+    /// 
+    /// # Panics
+    /// If the executor panics.
+    ///
     pub fn and_then_apply_ref_async_with_executor_and_error<X: Send + Sync, R>(
         &self,
         executor: impl InstancedFallibleExecutor<R> + Send + 'static,
@@ -1524,7 +1597,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         })
     }
 
-    /// Borrow a refence to the value of the stage without panicking.
+    /// Borrow a reference to the value of the stage without panicking.
     ///
     /// This function may block to wait for the stage to finish completing roughly for the given Duration.
     ///
@@ -1982,6 +2055,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         false
     }
 
+    /// Block until the stage is completed
     pub fn wait_for(&self) {
         if self.0.completed.load(SeqCst) {
             return;
@@ -1999,11 +2073,20 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         }
     }
 
+    /// Block until the stage is completed or roughly until the duration time has elapsed.
+    /// # Returns
+    /// true if the stage is now completed, false if the duration has elapsed.
     #[must_use]
     pub fn wait_timeout(&self, duration: Duration) -> bool {
+        if duration.is_zero() {
+            return self.completed();
+        }
         self.wait_until(Instant::now() + duration)
     }
 
+    /// Block until the stage is completed or roughly until the give instant.
+    /// # Returns
+    /// true if the stage is now completed, false if the instant is in the past without the stage completing.
     #[must_use]
     pub fn wait_until(&self, until: Instant) -> bool {
         if self.0.completed.load(SeqCst) {
@@ -2039,11 +2122,15 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
             .contains_key(&std::thread::current().id())
     }
 
+    /// Utility function that will call a closure with &self. 
+    /// This call does nothing to the stage itself and is simply to allow for some lambda style expressions.
     pub fn compose<Y>(&self, func: impl FnOnce(&Self) -> Y) -> &Self {
         _ = func(self);
         self
     }
 
+    /// Calls the closure once this stage completed. The closure itself returns a completion stage.
+    /// The returned stage is completed once the stage returned by closure completes.
     pub fn then_compose<X: Sync + Send>(
         &self,
         func: impl FnOnce(Completion<T>) -> CompletionStage<X> + 'static + Send,
@@ -2067,26 +2154,27 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         new_stage
     }
 
+    /// Calls the closure once this stage completed. The closure itself returns a completion stage.
+    /// The returned stage is completed once the stage returned by closure completes.
+    /// 
+    /// The closure is called using the given executor
     pub fn then_compose_async<E: InfallibleExecutor, X: Sync + Send>(
         &self,
         func: impl FnOnce(Completion<T>) -> CompletionStage<X> + 'static + Send,
     ) -> CompletionStage<X> {
         let new_stage = CompletionStage::new();
         let ncl = new_stage.clone();
-        self.then_run_internal(move |comp, q| {
-            q.push(move |_| {
-                func(comp).then_run_async::<E>(move |comp| match comp {
-                    Completion::Taken => _ = ncl.complete(Completion::Taken),
-                    Completion::Panic => _ = ncl.complete(Completion::Panic),
-                    Completion::Value(v) => _ = ncl.complete_with_value(v),
-                    Completion::DeadLock => _ = ncl.complete(Completion::DeadLock),
-                });
-            });
+        self.then_run_async::<E>(move |comp| {
+            func(comp).then_complete(ncl);
         });
 
         new_stage
     }
 
+    /// Calls the closure once this stage completed. The closure itself returns a completion stage.
+    /// The returned stage is completed once the stage returned by closure completes.
+    ///
+    /// The closure is called using the given executor
     pub fn then_compose_async_with_executor<X: Sync + Send>(
         &self,
         executor: impl InstancedInfallibleExecutor + Send + 'static,
@@ -2101,6 +2189,10 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         new_stage
     }
 
+    /// Calls the closure once this stage completed. The closure itself returns a completion stage.
+    /// The returned stage is completed once the stage returned by closure completes.
+    ///
+    /// The closure is called using the given executor
     pub fn then_compose_async_with_error<E: FallibleExecutor<R>, X: Sync + Send, R>(
         &self,
         func: impl FnOnce(Result<Completion<T>, R>) -> CompletionStage<X> + 'static + Send,
@@ -2114,6 +2206,10 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         new_stage
     }
 
+    /// Calls the closure once this stage completed. The closure itself returns a completion stage.
+    /// The returned stage is completed once the stage returned by closure completes.
+    ///
+    /// The closure is called using the given executor
     pub fn then_compose_async_with_executor_and_error<X: Sync + Send, R>(
         &self,
         executor: impl InstancedFallibleExecutor<R> + Send + 'static,
@@ -2128,6 +2224,12 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         new_stage
     }
 
+    /// Combines 2 completion stages, executing a closure when both stages complete.
+    /// The returned stage is completed after the closure returns.
+    /// 
+    /// # Thread of execution
+    /// Current thread if both stages are completed already.
+    /// Otherwise, the closure is executed in the thread that completes the last stage.
     pub fn then_combine<X: Send + Sync, Y: Send + Sync>(
         &self,
         other: &CompletionStage<X>,
