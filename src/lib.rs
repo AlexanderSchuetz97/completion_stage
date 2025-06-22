@@ -45,13 +45,14 @@
     clippy::unwrap_used,
     clippy::cargo_common_metadata,
     clippy::used_underscore_binding,
-    unsafe_code, 
+    unsafe_code
 )]
 
 use defer_heavy::defer;
 use parking_lot::{
     Condvar, MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::io::Error;
@@ -63,7 +64,6 @@ use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 use std::vec::IntoIter;
 use std::{mem, thread};
-use std::cell::RefCell;
 
 #[derive(Debug)]
 pub struct CompletionStage<T: Send + Sync + 'static>(Arc<CompletionStageInner<T>>);
@@ -129,7 +129,7 @@ enum CellValue<T> {
 
 impl<T> CellValue<T> {
     /// Take value out of the Cell leaving it in Taken state.
-    const fn take(&mut self) -> Self {
+    fn take(&mut self) -> Self {
         match self {
             Self::None => Self::None,
             Self::Taken => Self::Taken,
@@ -161,7 +161,6 @@ impl<T> CellValue<T> {
     }
 }
 
-
 /// Taker enum.
 ///
 enum Taker<T: Send + Sync> {
@@ -185,7 +184,6 @@ impl<T: Send + Sync> Debug for Taker<T> {
 }
 
 impl<T: Send + Sync> Taker<T> {
-
     /// returns true if the tasker is none.
     const fn is_none(&self) -> bool {
         matches!(self, Self::None)
@@ -291,7 +289,6 @@ impl<T: Send + Sync> Debug for CompleteStageInnerTasks<T> {
     }
 }
 
-
 /// complete the stage if the thread is panicking using a new queue.
 fn handle_supplier_panic<T: Send + Sync>(inner: &Arc<CompletionStageInner<T>>) {
     if std::thread::panicking() {
@@ -300,7 +297,10 @@ fn handle_supplier_panic<T: Send + Sync>(inner: &Arc<CompletionStageInner<T>>) {
 }
 
 /// complete the stage if the thread is panicking using the given queue.
-fn handle_supplier_panic_queue<T: Send + Sync>(inner: &Arc<CompletionStageInner<T>>, queue: &CompletionQueue) {
+fn handle_supplier_panic_queue<T: Send + Sync>(
+    inner: &Arc<CompletionStageInner<T>>,
+    queue: &CompletionQueue,
+) {
     if std::thread::panicking() {
         complete_inner_queue(inner, Completion::Panic, queue);
     }
@@ -323,7 +323,6 @@ fn complete_inner<T: Send + Sync>(
 struct CompletionQueue(RefCell<VecDeque<Box<dyn FnOnce(&CompletionQueue)>>>);
 
 impl CompletionQueue {
-
     /// Add a task to the queue.
     fn push(&self, task: impl FnOnce(&Self) + 'static) {
         self.0.borrow_mut().push_back(Box::new(task));
@@ -334,7 +333,7 @@ impl CompletionQueue {
         loop {
             let mut brw = self.0.borrow_mut();
             let Some(t) = brw.pop_front() else {
-              return;
+                return;
             };
             drop(brw);
             t(self);
@@ -355,10 +354,12 @@ impl Drop for CompletionQueue {
 
 /// Panic guard that will invoke the taker function on a drop when a ref tasks panics.
 #[allow(clippy::type_complexity)]
-struct TakerPanicGuard<'a, T>(Option<Box<dyn FnOnce(Completion<T>, &CompletionQueue) + Send>>, &'a CompletionQueue);
+struct TakerPanicGuard<'a, T>(
+    Option<Box<dyn FnOnce(Completion<T>, &CompletionQueue) + Send>>,
+    &'a CompletionQueue,
+);
 
-impl <T> TakerPanicGuard<'_, T> {
-
+impl<T> TakerPanicGuard<'_, T> {
     /// Invoke the function in the panic guard.
     fn invoke(mut self, comp: Completion<T>) {
         self.0.take().expect("TakerPanicGuard invoke is none")(comp, self.1);
@@ -450,7 +451,6 @@ pub enum GetTimeoutResult<T> {
 }
 
 impl<T> GetTimeoutResult<T> {
-
     /// Unwraps the value from the result
     /// # Panics
     /// If self is not a Value
@@ -468,7 +468,7 @@ impl<T> GetTimeoutResult<T> {
     pub fn value(self) -> Option<T> {
         match self {
             Self::Value(v) => Some(v),
-            _=> None,
+            _ => None,
         }
     }
 }
@@ -538,7 +538,6 @@ impl<T: Send + Sync + 'static> Default for CompletionStage<T> {
 }
 
 impl<T: Send + Sync + 'static> CompletionStage<T> {
-
     /// Create a new uncompleted `CompletionStage` that is not associated with any background task.
     pub fn new() -> Self {
         Self(Arc::new(CompletionStageInner {
@@ -1097,14 +1096,12 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
     ) -> &Self {
         let scl = self.clone();
         self.then_run_ref_internal(|_, _| {
-            E::execute(move || {
-                match scl.try_get_ref() {
-                    GetTimeoutResult::TimedOut => unreachable!("then_run_ref_async TimedOut"),
-                    GetTimeoutResult::Taken => func(Completion::Taken),
-                    GetTimeoutResult::Panic => func(Completion::Panic),
-                    GetTimeoutResult::DeadLock => func(Completion::DeadLock),
-                    GetTimeoutResult::Value(data) => func(Completion::Value(&*data)),
-                }
+            E::execute(move || match scl.try_get_ref() {
+                GetTimeoutResult::TimedOut => unreachable!("then_run_ref_async TimedOut"),
+                GetTimeoutResult::Taken => func(Completion::Taken),
+                GetTimeoutResult::Panic => func(Completion::Panic),
+                GetTimeoutResult::DeadLock => func(Completion::DeadLock),
+                GetTimeoutResult::Value(data) => func(Completion::Value(&*data)),
             });
         })
     }
@@ -1118,16 +1115,14 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
     ) -> &Self {
         let scl = self.clone();
         self.then_run_ref_internal(move |_, _| {
-            executor.execute(move || {
-                match scl.try_get_ref() {
-                    GetTimeoutResult::TimedOut => {
-                        unreachable!("then_run_ref_async_with_executor TimedOut")
-                    }
-                    GetTimeoutResult::Taken => func(Completion::Taken),
-                    GetTimeoutResult::Panic => func(Completion::Panic),
-                    GetTimeoutResult::DeadLock => func(Completion::DeadLock),
-                    GetTimeoutResult::Value(data) => func(Completion::Value(&*data)),
+            executor.execute(move || match scl.try_get_ref() {
+                GetTimeoutResult::TimedOut => {
+                    unreachable!("then_run_ref_async_with_executor TimedOut")
                 }
+                GetTimeoutResult::Taken => func(Completion::Taken),
+                GetTimeoutResult::Panic => func(Completion::Panic),
+                GetTimeoutResult::DeadLock => func(Completion::DeadLock),
+                GetTimeoutResult::Value(data) => func(Completion::Value(&*data)),
             });
         })
     }
@@ -1254,7 +1249,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
         }
         drop(guard);
 
-        let task= Box::new(func);
+        let task = Box::new(func);
 
         let Some(rts) = locked.ref_tasks.as_mut() else {
             panic!("ref_task_state is none even tho cell was empty.");
@@ -1445,7 +1440,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
     /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
     ///
     /// The closure is executed using the given executor.
-    /// 
+    ///
     /// # Panics
     /// If the executor panics.
     pub fn and_then_apply_async<E: InfallibleExecutor, X: Send + Sync>(
@@ -1460,7 +1455,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
     ///
     /// The closure is executed using the given executor
     /// If the executor errors then the closure is executed with the error in the current thread.
-    /// 
+    ///
     /// # Panics
     /// If the closure is executed in the current thread and it panics.
     /// If the executor panics.
@@ -1478,7 +1473,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
     /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
     ///
     /// The closure is executed using the given executor.
-    /// 
+    ///
     /// # Panics
     /// If the executor panics.
     pub fn and_then_apply_async_with_executor<X: Send + Sync>(
@@ -1494,7 +1489,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
     ///
     /// The closure is executed using the given executor.
     /// If the executor errors then the closure is executed with the error in the current thread.
-    /// 
+    ///
     /// # Panics
     /// If the closure is executed in the current thread and it panics.
     /// If the executor panics.
@@ -1549,7 +1544,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
     /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
     ///
     /// The closure is executed using the given executor
-    /// 
+    ///
     /// # Panics
     /// If the closure is executed in the current thread and it panics.
     /// If the executor panics.
@@ -1567,7 +1562,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
     /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
     ///
     /// The closure is executed using the given executor
-    /// 
+    ///
     /// # Panics
     /// If the executor panics.
     pub fn and_then_apply_ref_async_with_executor<X: Send + Sync>(
@@ -1582,7 +1577,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
     /// The closure is only executed if the stage is completed with a value. Should the stage be completed with `Panic` or `Taken` then the closure is never executed.
     ///
     /// The closure is executed using the given executor
-    /// 
+    ///
     /// # Panics
     /// If the executor panics.
     ///
@@ -2066,7 +2061,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
             let cell = self.0.cell.read_recursive();
             match &*cell {
                 CellValue::None => (),
-                _=> return,
+                _ => return,
             }
             drop(cell);
             self.0.cell_cond.wait(&mut locked);
@@ -2098,7 +2093,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
             let cell = self.0.cell.read_recursive();
             match &*cell {
                 CellValue::None => (),
-                _=> return true,
+                _ => return true,
             }
             drop(cell);
             if self.0.cell_cond.wait_until(&mut locked, until).timed_out() {
@@ -2122,7 +2117,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
             .contains_key(&std::thread::current().id())
     }
 
-    /// Utility function that will call a closure with &self. 
+    /// Utility function that will call a closure with &self.
     /// This call does nothing to the stage itself and is simply to allow for some lambda style expressions.
     pub fn compose<Y>(&self, func: impl FnOnce(&Self) -> Y) -> &Self {
         _ = func(self);
@@ -2156,7 +2151,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
 
     /// Calls the closure once this stage completed. The closure itself returns a completion stage.
     /// The returned stage is completed once the stage returned by closure completes.
-    /// 
+    ///
     /// The closure is called using the given executor
     pub fn then_compose_async<E: InfallibleExecutor, X: Sync + Send>(
         &self,
@@ -2226,7 +2221,7 @@ impl<T: Send + Sync + 'static> CompletionStage<T> {
 
     /// Combines 2 completion stages, executing a closure when both stages complete.
     /// The returned stage is completed after the closure returns.
-    /// 
+    ///
     /// # Thread of execution
     /// Current thread if both stages are completed already.
     /// Otherwise, the closure is executed in the thread that completes the last stage.
